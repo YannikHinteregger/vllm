@@ -343,7 +343,10 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
     def _do_send_reg_notif(self, req_id: str, reg_data: dict[str, Any]) -> None:
         engine_id = reg_data["remote_engine_id"]
         notif_msg = PUSH_REG_NOTIF_PREFIX + msgspec.msgpack.encode(reg_data)
-        agents = self._remote_agents.get(engine_id)
+        # The handshake executor replaces this dict under the lock, so
+        # snapshot it rather than iterating it.
+        with self._handshake_lock:
+            agents = dict(self._remote_agents.get(engine_id) or {})
         if not agents:
             logger.error(
                 "No remote agents for engine %s; cannot send registration for %s",
