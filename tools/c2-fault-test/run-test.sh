@@ -219,7 +219,9 @@ echo | tee -a "$RUN_LOG"
 log "================ RESULT ================"
 
 REPORTED=$(count_matches "Producer could not write all KV" "$LOG_DIR/decoder.log")
-INJECTED=$(count_matches "FAULT INJECTION" "$LOG_DIR/prefiller.log")
+# Must not match the "FAULT INJECTION ARMED" banner serve-prefiller.sh
+# prints at startup, or every run over-reports by exactly one.
+INJECTED=$(count_matches "FAULT INJECTION: not posting" "$LOG_DIR/prefiller.log")
 
 log "prefiller: $INJECTED dropped WRITEs"
 log "decoder:   $REPORTED failed-push reports"
