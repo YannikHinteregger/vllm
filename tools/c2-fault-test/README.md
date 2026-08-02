@@ -92,13 +92,15 @@ actually shaped around.
 
 The contrast worth putting in the PR:
 
+The branch is rebased onto `main`, so `main` is the "without the fix" side.
+
 ```bash
 git stash                                   # park the tooling
-git checkout c2-base-5fa0154                # the base commit
-git stash pop                               # tooling back, without the fix
-./run-test.sh                               # request hangs to the timeout
+git checkout main                           # no fix
+git stash pop                               # tooling back
+./run-test.sh --no-docker                   # request hangs to the timeout
 git checkout test/nixl-push-fault-injection
-./run-test.sh                               # D reports, request returns
+./run-test.sh --no-docker                   # D reports, request returns
 ```
 
 ## What this does and does not prove
