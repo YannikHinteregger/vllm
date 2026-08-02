@@ -1,0 +1,77 @@
+# Two vLLM instances (P and D) plus the repo's toy proxy, for exercising the
+# C2 unposted-WRITE path. Host networking so the NIXL side channel and the
+# proxy reach each other on localhost exactly as the CI harness expects.
+#
+# Every service tees to /logs, which is bind-mounted to ./logs on the host.
+
+x-common: &common
+  image: ${VLLM_IMAGE:-vllm-c2-test:local}
+  network_mode: host
+  ipc: host
+  volumes:
+    - ./:/opt/c2:ro
+    - ../../:/opt/vllm-src:ro
+    - ./logs:/logs
+    - ${HF_CACHE:-~/.cache/huggingface}:/root/.cache/huggingface
+  environment:
+    - HF_TOKEN=${HF_TOKEN:-}
+    - MODEL=${MODEL:-Qwen/Qwen3-0.6B}
+    - GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.6}
+    - UCX_NET_DEVICES=all
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+
+services:
+  prefiller:
+    <<: *common
+    container_name: c2-prefiller
+    environment:
+      - HF_TOKEN=${HF_TOKEN:-}
+      - MODEL=${MODEL:-Qwen/Qwen3-0.6B}
+      - GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.6}
+      - UCX_NET_DEVICES=all
+      - CUDA_VISIBLE_DEVICES=${PREFILL_GPUS:-0}
+      - PREFILL_TP=${PREFILL_TP:-1}
+      - PREFILL_PORT=${PREFILL_PORT:-8100}
+      - VLLM_PORT=20000
+      - VLLM_KV_CACHE_LAYOUT=HND
+      - VLLM_NIXL_SIDE_CHANNEL_PORT=${PREFILL_SIDE_CHANNEL_PORT:-5559}
+      # The fault. Empty/unset => inert, so this same file runs the baseline.
+      - VLLM_PUSH_FAIL_ON_TP_RANK=${FAIL_RANK:-}
+    entrypoint: ["/bin/bash", "-lc"]
+    command: "bash /opt/c2/serve-prefiller.sh 2>&1 | tee /logs/prefiller.log"
+
+  decoder:
+    <<: *common
+    container_name: c2-decoder
+    environment:
+      - HF_TOKEN=${HF_TOKEN:-}
+      - MODEL=${MODEL:-Qwen/Qwen3-0.6B}
+      - GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.6}
+      - UCX_NET_DEVICES=all
+      - CUDA_VISIBLE_DEVICES=${DECODE_GPUS:-1}
+      - DECODE_TP=${DECODE_TP:-1}
+      - DECODE_PORT=${DECODE_PORT:-8200}
+      - FAILURE_POLICY=${FAILURE_POLICY:-recompute}
+      - VLLM_PORT=30000
+      - VLLM_KV_CACHE_LAYOUT=HND
+      - VLLM_NIXL_SIDE_CHANNEL_PORT=${DECODE_SIDE_CHANNEL_PORT:-5659}
+    entrypoint: ["/bin/bash", "-lc"]
+    command: "bash /opt/c2/serve-decoder.sh 2>&1 | tee /logs/decoder.log"
+
+  proxy:
+    <<: *common
+    container_name: c2-proxy
+    depends_on: [prefiller, decoder]
+    entrypoint: ["/bin/bash", "-lc"]
+    command: >
+      python3 /opt/vllm-src/tests/v1/kv_connector/nixl_integration/toy_proxy_server.py
+      --port ${PROXY_PORT:-8192}
+      --prefiller-hosts localhost --prefiller-ports ${PREFILL_PORT:-8100}
+      --decoder-hosts localhost --decoder-ports ${DECODE_PORT:-8200}
+      2>&1 | tee /logs/proxy.log

@@ -31,6 +31,7 @@ the writer drops any leftover ``_push_finished_blocks`` /
 ``_pending_d_registrations`` and stops self-polling.
 """
 
+import os
 import queue
 import threading
 import time
@@ -605,14 +606,28 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                     spec.remote_rank
                 ]
 
-                handle = self._xfer_blocks(
-                    read_spec=spec,
-                    request_id=req_id,
-                    dst_engine_id=engine_id,
-                    remote_request_id=meta.remote.request_id,
-                    local_xfer_side_handle=local_xfer_side_handle,
-                    remote_xfer_side_handle=remote_xfer_side_handle,
-                )
+                _fail_rank = os.getenv("VLLM_PUSH_FAIL_ON_TP_RANK")
+                if _fail_rank is not None and self.tp_rank == int(_fail_rank):
+                    # Skip the call entirely: _xfer_blocks posts the WRITE and
+                    # arms its completion notif before returning, so nulling
+                    # the handle afterwards would double-notify this edge.
+                    logger.error(
+                        "FAULT INJECTION: not posting WRITE from tp_rank %d to "
+                        "remote rank %d for request %s",
+                        self.tp_rank,
+                        spec.remote_rank,
+                        req_id,
+                    )
+                    handle = None
+                else:
+                    handle = self._xfer_blocks(
+                        read_spec=spec,
+                        request_id=req_id,
+                        dst_engine_id=engine_id,
+                        remote_request_id=meta.remote.request_id,
+                        local_xfer_side_handle=local_xfer_side_handle,
+                        remote_xfer_side_handle=remote_xfer_side_handle,
+                    )
                 if handle is not None:
                     handles.append(handle)
                     posted_ranks.add(spec.remote_rank)
