@@ -12,32 +12,45 @@ Fixes row **C2** of #48633.
 
 **Solution:** This PR introduces a new NIXL message that the prefill node sends when it cannot start a transfer. The decode node then still receives the number of messages it expects, so instead of waiting forever it can tell that one of the transfers failed. When that happens it falls back to the existing KV load failure policy, which either fails the request or recomputes the KV locally.
 
-## Test plan
+## Test Plan
 
-Added 10 unit tests. The 4 failures in the wider connector suite are pre-existing and reproduce on the base commit:
-
-```text
-FAILED tests/v1/kv_connector/unit/test_nixl_connector.py::test_abort_timeout_on_prefiller[ray]
-FAILED tests/v1/kv_connector/unit/test_nixl_connector.py::test_abort_timeout_on_prefiller[None]
-FAILED tests/v1/kv_connector/unit/test_nixl_connector_hma.py::test_fewer_blocks_with_hma[google/gemma-3-1b-it-512]
-FAILED tests/v1/kv_connector/unit/test_multi_connector.py::test_multi_example_connector_consistency
+```bash
+.venv/bin/python -m pytest tests/v1/kv_connector/unit/test_nixl_push_connector.py -q
 ```
 
-Also tested on a real deployment: two RTX 4000 Ada GPUs running a prefill and a decode instance, with a small local modification that simulates a NIXL failure and provokes the bad path.
+```bash
+.venv/bin/python -m pytest \
+  tests/v1/kv_connector/unit/test_nixl_connector.py \
+  tests/v1/kv_connector/unit/test_nixl_connector_hma.py \
+  tests/v1/kv_connector/unit/test_nixl_heartbeat.py \
+  tests/v1/kv_connector/unit/test_multi_connector.py -q
+```
 
-- **Good path:** output byte-identical to the base commit.
-- **Bad path:** the decode node is told, fails the request, recomputes locally and returns normally. On the base commit the same fault produces no report at all and the request hangs.
+Also tested on a real deployment: two RTX 4000 Ada GPUs running a prefill and a decode instance, with a small local modification that simulates a NIXL failure to provoke the bad path.
+
+## Test Result
+
+```text
+47 passed
+```
+
+All 10 new tests pass.
+
+```text
+157 passed, 1 skipped, 4 failed
+```
+
+The four failures are pre-existing. They fail identically on main at the same commit this branch is rebased onto: `test_abort_timeout_on_prefiller[ray]`, `test_abort_timeout_on_prefiller[None]`, `test_fewer_blocks_with_hma[google/gemma-3-1b-it-512]`, `test_multi_example_connector_consistency`.
+
+On the real deployment:
+
+- **Good path:** output is the same as main.
+- **Bad path:** the decode node is told, fails the request, recomputes locally and returns normally. On main the same fault produces no report at all and the request hangs.
 
 Logs: [good path](<LINK_BASELINE>) · [bad path](<LINK_FAULT>)
 
 Both instances ran on one host. This exercises the coordination logic rather than a real network transfer. The failure is simulated.
 
-No model evaluation needed. This path only runs when a transfer fails to start. It cannot change output on any request that succeeds.
-
 ## Notes
-
-Some cases are not covered: transfers that fail after starting, handshake failures, unresolvable ranks, hybrid and multi-group models. I can expand on any of them.
-
-Not a duplicate. The open PRs on #48633 cover stale remote cleanup and prefix caching. C2 is unclaimed and I asked for it on the issue.
 
 AI assistance was used for this change. I reviewed every changed line and ran the tests myself.
