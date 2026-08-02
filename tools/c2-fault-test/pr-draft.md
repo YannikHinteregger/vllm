@@ -12,7 +12,7 @@ Fixes row **C2** of #48633.
 
 **Solution:** This PR introduces a new NIXL message that the prefill node sends when it cannot start a transfer. The decode node then still receives the number of messages it expects, so instead of waiting forever it can tell that one of the transfers failed. When that happens it falls back to the existing KV load failure policy, which either fails the request or recomputes the KV locally.
 
-## Tested through
+## Tested by
 
 ```bash
 .venv/bin/python -m pytest tests/v1/kv_connector/unit/test_nixl_push_connector.py -q
