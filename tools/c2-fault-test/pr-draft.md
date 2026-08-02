@@ -12,10 +12,11 @@ Fixes row **C2** of #48633.
 
 **Solution:** This PR introduces a new NIXL message that the prefill node sends when it cannot start a transfer. The decode node then still receives the number of messages it expects, so instead of waiting forever it can tell that one of the transfers failed. When that happens it falls back to the existing KV load failure policy, which either fails the request or recomputes the KV locally.
 
-## Test Plan
+## Tested through
 
 ```bash
 .venv/bin/python -m pytest tests/v1/kv_connector/unit/test_nixl_push_connector.py -q
+# 47 passed
 ```
 
 ```bash
@@ -24,25 +25,12 @@ Fixes row **C2** of #48633.
   tests/v1/kv_connector/unit/test_nixl_connector_hma.py \
   tests/v1/kv_connector/unit/test_nixl_heartbeat.py \
   tests/v1/kv_connector/unit/test_multi_connector.py -q
+# 157 passed, 1 skipped, 4 failed
 ```
 
-Also tested on a real deployment: two RTX 4000 Ada GPUs running a prefill and a decode instance, with a small local modification that simulates a NIXL failure to provoke the bad path.
+All 10 new tests pass. `test_abort_timeout_on_prefiller[ray]`, `test_abort_timeout_on_prefiller[None]`, `test_fewer_blocks_with_hma[google/gemma-3-1b-it-512]` and `test_multi_example_connector_consistency` also fail on main at the same commit this branch is rebased onto.
 
-## Test Result
-
-```text
-47 passed
-```
-
-All 10 new tests pass.
-
-```text
-157 passed, 1 skipped, 4 failed
-```
-
-The four failures are pre-existing. They fail identically on main at the same commit this branch is rebased onto: `test_abort_timeout_on_prefiller[ray]`, `test_abort_timeout_on_prefiller[None]`, `test_fewer_blocks_with_hma[google/gemma-3-1b-it-512]`, `test_multi_example_connector_consistency`.
-
-On the real deployment:
+Also tested this on a real deployment: two RTX 4000 Ada GPUs running a prefill and a decode instance, with a small local modification that simulates a NIXL failure to provoke the bad path.
 
 - **Good path:** output is the same as main.
 - **Bad path:** the decode node is told, fails the request, recomputes locally and returns normally. On main the same fault produces no report at all and the request hangs.
