@@ -606,8 +606,10 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                     spec.remote_rank
                 ]
 
+                # Truthiness, not `is not None`: compose passes the var through
+                # as an empty string on a baseline run, and int("") raises.
                 _fail_rank = os.getenv("VLLM_PUSH_FAIL_ON_TP_RANK")
-                if _fail_rank is not None and self.tp_rank == int(_fail_rank):
+                if _fail_rank and self.tp_rank == int(_fail_rank):
                     # Skip the call entirely: _xfer_blocks posts the WRITE and
                     # arms its completion notif before returning, so nulling
                     # the handle afterwards would double-notify this edge.

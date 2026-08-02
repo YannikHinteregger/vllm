@@ -7,6 +7,7 @@
 #   ./run-test.sh              # fault armed on producer rank 0
 #   ./run-test.sh --baseline   # no fault; proves the happy path still works
 #   ./run-test.sh --keep-up    # leave the stack running for poking at
+#   ./run-test.sh --no-docker  # bare processes; needs an active venv with vllm
 #
 # Everything lands in ./logs/. Copy that directory off the box for the PR.
 set -euo pipefail
@@ -16,11 +17,13 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 FAIL_RANK_DEFAULT=0
 KEEP_UP=0
 BASELINE=0
+NO_DOCKER=${NO_DOCKER:-0}
 for arg in "$@"; do
   case "$arg" in
     --baseline) BASELINE=1 ;;
     --keep-up)  KEEP_UP=1 ;;
-    -h|--help)  sed -n '2,12p' "$0"; exit 0 ;;
+    --no-docker) NO_DOCKER=1 ;;
+    -h|--help)  sed -n '2,13p' "$0"; exit 0 ;;
     *) echo "unknown option: $arg" >&2; exit 2 ;;
   esac
 done
@@ -63,11 +66,18 @@ rm -rf "$LOG_DIR"; mkdir -p "$LOG_DIR"
 
 cleanup() {
   if [[ "$KEEP_UP" == "1" ]]; then
-    log "--keep-up set; leaving the stack running. Tear down with: docker compose down -v"
+    log "--keep-up set; leaving the stack running."
     return
   fi
   log "tearing down"
-  compose down -v >>"$RUN_LOG" 2>&1 || true
+  if [[ "$NO_DOCKER" == "1" ]]; then
+    pkill -f toy_proxy_server.py 2>/dev/null || true
+    pkill -TERM -f "vllm serve" 2>/dev/null || true
+    sleep 3
+    pkill -9 -f "vllm serve" 2>/dev/null || true
+  else
+    compose down -v >>"$RUN_LOG" 2>&1 || true
+  fi
 }
 trap cleanup EXIT
 
@@ -80,22 +90,76 @@ fi
 log "decoder kv_load_failure_policy=$FAILURE_POLICY"
 
 # --- preflight ------------------------------------------------------------
-command -v docker >/dev/null || { echo "docker not found" >&2; exit 1; }
-docker compose version >/dev/null 2>&1 || { echo "'docker compose' plugin not found" >&2; exit 1; }
-if ! docker run --rm --gpus all "$VLLM_IMAGE" true >/dev/null 2>&1; then
-  if ! docker image inspect "$VLLM_IMAGE" >/dev/null 2>&1; then
-    log "image $VLLM_IMAGE not found; building from the repo (this takes a while)"
-    docker build -f "$REPO_ROOT/docker/Dockerfile" --target vllm-openai \
-      -t "$VLLM_IMAGE" "$REPO_ROOT" 2>&1 | tee -a "$LOG_DIR/build.log"
-  else
-    echo "image exists but 'docker run --gpus all' failed; is the NVIDIA container runtime installed?" >&2
-    exit 1
+if [[ "$NO_DOCKER" == "0" ]]; then
+  command -v docker >/dev/null || { echo "docker not found (try --no-docker)" >&2; exit 1; }
+  docker compose version >/dev/null 2>&1 || { echo "'docker compose' plugin not found (try --no-docker)" >&2; exit 1; }
+  if ! docker run --rm --gpus all "$VLLM_IMAGE" true >/dev/null 2>&1; then
+    if ! docker image inspect "$VLLM_IMAGE" >/dev/null 2>&1; then
+      log "image $VLLM_IMAGE not found; building from the repo (this takes a while)"
+      docker build -f "$REPO_ROOT/docker/Dockerfile" --target vllm-openai \
+        -t "$VLLM_IMAGE" "$REPO_ROOT" 2>&1 | tee -a "$LOG_DIR/build.log"
+    else
+      echo "image exists but 'docker run --gpus all' failed; is the NVIDIA container runtime installed?" >&2
+      exit 1
+    fi
   fi
+else
+  command -v vllm >/dev/null || {
+    echo "vllm not on PATH. Activate the venv you installed it into, e.g.:" >&2
+    echo "  source /workspace/vllm/.venv/bin/activate" >&2
+    exit 1
+  }
+  log "no-docker mode: using $(command -v vllm)"
 fi
 
 # --- bring the stack up ---------------------------------------------------
-log "starting prefiller + decoder"
-compose up -d prefiller decoder >>"$RUN_LOG" 2>&1
+PREFILLER_PID=""
+DECODER_PID=""
+PROXY_PID=""
+
+# $6 is the fault rank and is only ever passed for the prefiller. It must go
+# through `env` explicitly: `VAR=x some_function` sets a shell variable for the
+# call, it does not export VAR into commands the function then runs.
+start_native() {
+  local name=$1 gpus=$2 sc_port=$3 internal_port=$4 script=$5 fail_rank=${6:-}
+  log "starting $name (GPU $gpus)"
+  env CUDA_VISIBLE_DEVICES="$gpus" \
+      VLLM_NIXL_SIDE_CHANNEL_PORT="$sc_port" \
+      VLLM_PORT="$internal_port" \
+      VLLM_KV_CACHE_LAYOUT=HND \
+      UCX_NET_DEVICES=all \
+      VLLM_PUSH_FAIL_ON_TP_RANK="$fail_rank" \
+      bash "$PWD/$script" > "$LOG_DIR/${name}.log" 2>&1 &
+  case "$name" in
+    prefiller) PREFILLER_PID=$! ;;
+    decoder)   DECODER_PID=$! ;;
+  esac
+}
+
+if [[ "$NO_DOCKER" == "1" ]]; then
+  start_native prefiller "$PREFILL_GPUS" "${PREFILL_SIDE_CHANNEL_PORT:-5559}" \
+    20000 serve-prefiller.sh "$FAIL_RANK"
+  start_native decoder "$DECODE_GPUS" "${DECODE_SIDE_CHANNEL_PORT:-5659}" \
+    30000 serve-decoder.sh
+else
+  log "starting prefiller + decoder"
+  compose up -d prefiller decoder >>"$RUN_LOG" 2>&1
+fi
+
+alive() {
+  local name=$1 pid=""
+  if [[ "$NO_DOCKER" == "1" ]]; then
+    # serve-*.sh ends in `exec vllm serve`, so the pid we captured is the
+    # server itself and kill -0 is a real liveness check.
+    case "$name" in
+      prefiller) pid=$PREFILLER_PID ;;
+      decoder)   pid=$DECODER_PID ;;
+    esac
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+  else
+    [[ "$(docker inspect -f '{{.State.Running}}' "c2-${name}" 2>/dev/null)" == "true" ]]
+  fi
+}
 
 wait_for() {
   local name=$1 port=$2 deadline=$((SECONDS + ${3:-900}))
@@ -105,8 +169,8 @@ wait_for() {
       log "TIMEOUT waiting for $name; see logs/${name}.log"
       return 1
     fi
-    if [[ "$(docker inspect -f '{{.State.Running}}' "c2-${name}" 2>/dev/null)" != "true" ]]; then
-      log "container c2-${name} exited; see logs/${name}.log"
+    if ! alive "$name"; then
+      log "$name exited; see logs/${name}.log"
       return 1
     fi
     sleep 3
@@ -118,7 +182,16 @@ wait_for prefiller "$PREFILL_PORT" || exit 1
 wait_for decoder   "$DECODE_PORT"   || exit 1
 
 log "starting proxy"
-compose up -d proxy >>"$RUN_LOG" 2>&1
+if [[ "$NO_DOCKER" == "1" ]]; then
+  python3 "$REPO_ROOT/tests/v1/kv_connector/nixl_integration/toy_proxy_server.py" \
+    --port "$PROXY_PORT" \
+    --prefiller-hosts localhost --prefiller-ports "$PREFILL_PORT" \
+    --decoder-hosts localhost --decoder-ports "$DECODE_PORT" \
+    > "$LOG_DIR/proxy.log" 2>&1 &
+  PROXY_PID=$!
+else
+  compose up -d proxy >>"$RUN_LOG" 2>&1
+fi
 sleep 5
 
 # --- drive one request ----------------------------------------------------

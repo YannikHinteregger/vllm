@@ -28,10 +28,32 @@ cd tools/c2-fault-test
 ./run-test.sh              # fault armed on producer rank 0
 ```
 
-First run builds `vllm-c2-test:local` from `docker/Dockerfile`, which is slow.
-Point `VLLM_IMAGE` at an existing image to skip it — it must have NIXL
-(`requirements/kv_connectors.txt`) and be close enough to `5fa015444` that the
-patched `push_worker.py` still matches its APIs.
+First run builds `vllm-c2-test:local` from `docker/Dockerfile`, which is slow
+and needs well over 40 GB of disk. Point `VLLM_IMAGE` at an existing image to
+skip it — it must have NIXL (`requirements/kv_connectors.txt`) and be close
+enough to `5fa015444` that the patched `push_worker.py` still matches its APIs.
+
+### Without Docker
+
+A RunPod pod is itself a container and usually cannot run Docker, and the
+image build wants more disk than a small pod has. `--no-docker` runs the same
+three processes natively, with the same env wiring, `logs/` layout and verdict:
+
+```bash
+export HF_HOME=/workspace/hf UV_CACHE_DIR=/workspace/uv-cache
+export XDG_CACHE_HOME=/workspace/.cache
+uv venv --python 3.12 && source .venv/bin/activate
+VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=auto
+uv pip install -r requirements/kv_connectors.txt
+
+cd tools/c2-fault-test
+./run-test.sh --no-docker --baseline
+./run-test.sh --no-docker
+```
+
+The change is Python-only, so `VLLM_USE_PRECOMPILED=1` fetches a wheel instead
+of compiling — a few GB rather than tens. Set the cache vars *before* the first
+install, or they fill the container disk instead of the volume.
 
 Logs land in `./logs/` (`prefiller.log`, `decoder.log`, `proxy.log`,
 `run.log`, `response.json`). Copy that directory off the box.
