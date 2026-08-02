@@ -36,6 +36,9 @@ import pytest
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     push_worker as push_worker_module,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
+    NixlBaseConnectorWorker,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     PUSH_FAIL_NOTIF_PREFIX,
     PUSH_REG_NOTIF_PREFIX,
@@ -1039,47 +1042,57 @@ class TestPushPipelineParallel:
         assert meta.block_lens == [block_len, block_len]
 
 
+def _push_worker_writing_to(d_ranks, *, use_mla: bool = True):
+    """A producer worker handshook with consumer ranks ``d_ranks``.
+
+    ``use_mla`` selects which branch resolves the write ranks: MLA replicates
+    the latent to every handshaked rank, every other model writes the
+    tp-mapping's source ranks (which, in the push direction, are D's).
+    """
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
+        TPMapping,
+    )
+
+    engine_id = "decode-engine"
+    w = _StubWriterWorker.fresh()
+    w.use_mla = use_mla
+    w.nixl_wrapper = MagicMock()
+    w.transfer_topo = MagicMock()
+    w.transfer_topo.get_engine_info.return_value = SimpleNamespace(
+        remote_tp_size=len(d_ranks),
+        remote_block_size=16,
+        remote_physical_blocks_per_logical=1,
+    )
+    # D_TP > P_TP => negative ratio (one P rank feeds |ratio| D ranks).
+    tp_ratio = -len(d_ranks)
+    w.transfer_topo.tp_ratio.return_value = tp_ratio
+    # The tp-mapping collapses MLA to a single source rank (correct for the
+    # pull/read direction); the push path must fan it back out.
+    source_ranks = (0,) if use_mla else tuple(d_ranks)
+    w.tp_mappings = {
+        engine_id: TPMapping(
+            source_ranks_per_group=(source_ranks,),
+            all_source_ranks=source_ranks,
+            rank_to_attention_slot={r: i for i, r in enumerate(source_ranks)},
+            rank_offset_factor=0,
+        )
+    }
+    w._logical_to_kernel_block_ids = lambda block_ids, ratio: block_ids
+    w.dst_xfer_side_handles = {engine_id: {r: 1000 + r for r in d_ranks}}
+    w.src_xfer_handles_by_block_size = {16: 2000}
+    # Non-MLA hetero TP chunks local memory per target rank.
+    w.src_xfer_handles_by_tp_ratio = {
+        (tp_ratio, 16): [3000 + i for i in range(len(d_ranks))]
+    }
+    w._remote_agents = {engine_id: {(0, r): f"agent-{r}" for r in d_ranks}}
+    return w, engine_id
+
+
 class TestPushWriterMlaReplication:
     """MLA latent KV is replicated across D's TP ranks, so when D_TP > P_TP
     (``tp_ratio < 0``) the producer must *WRITE* the latent into every D rank
     it handshook -- not write one and merely notify the rest, which would
     leave the un-written ranks decoding against stale KV."""
-
-    @staticmethod
-    def _mla_worker_writing_to(d_ranks):
-        from types import SimpleNamespace
-
-        from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
-            TPMapping,
-        )
-
-        engine_id = "decode-engine"
-        w = _StubWriterWorker.fresh()
-        w.use_mla = True
-        w.nixl_wrapper = MagicMock()
-        w.transfer_topo = MagicMock()
-        w.transfer_topo.get_engine_info.return_value = SimpleNamespace(
-            remote_tp_size=len(d_ranks),
-            remote_block_size=16,
-            remote_physical_blocks_per_logical=1,
-        )
-        # D_TP > P_TP => negative ratio (one P rank feeds |ratio| D ranks).
-        w.transfer_topo.tp_ratio.return_value = -len(d_ranks)
-        # The tp-mapping collapses MLA to a single source rank (correct for
-        # the pull/read direction); the push path must fan it back out.
-        w.tp_mappings = {
-            engine_id: TPMapping(
-                source_ranks_per_group=((0,),),
-                all_source_ranks=(0,),
-                rank_to_attention_slot={0: 0},
-                rank_offset_factor=0,
-            )
-        }
-        w._logical_to_kernel_block_ids = lambda block_ids, ratio: block_ids
-        w.dst_xfer_side_handles = {engine_id: {r: 1000 + r for r in d_ranks}}
-        w.src_xfer_handles_by_block_size = {16: 2000}
-        w._remote_agents = {engine_id: {(0, r): f"agent-{r}" for r in d_ranks}}
-        return w, engine_id
 
     def test_mla_hetero_tp_writes_every_d_rank(self):
         from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
@@ -1087,7 +1100,7 @@ class TestPushWriterMlaReplication:
             ReqMeta,
         )
 
-        w, engine_id = self._mla_worker_writing_to(d_ranks=(0, 1))
+        w, engine_id = _push_worker_writing_to(d_ranks=(0, 1))
 
         written: list[int] = []
 
@@ -1168,10 +1181,12 @@ class TestPushWriteFailureReporting:
         w._pending_completion_notifs.put(msg.encode())
         w._get_new_notifs()
 
-    def test_producer_reports_the_rank_whose_write_was_not_posted(self):
-        w, engine_id = TestPushWriterMlaReplication._mla_worker_writing_to(
-            d_ranks=(0, 1)
-        )
+    @pytest.mark.parametrize("use_mla", [True, False])
+    def test_producer_reports_the_rank_whose_write_was_not_posted(self, use_mla):
+        """Both branches that resolve the write ranks must report: MLA's
+        fan-out to every handshaked rank, and the tp-mapping's source ranks
+        that every other model goes through."""
+        w, engine_id = _push_worker_writing_to(d_ranks=(0, 1), use_mla=use_mla)
         # Rank 1's submission fails; rank 0's succeeds.
         w._xfer_blocks = lambda **kw: (
             None if kw["read_spec"].remote_rank == 1 else 1000
@@ -1187,6 +1202,21 @@ class TestPushWriteFailureReporting:
         assert call.args[0] == "agent-1"
         assert call.kwargs["notif_msg"].startswith(PUSH_FAIL_NOTIF_PREFIX)
         assert b"d-req" in call.kwargs["notif_msg"]
+
+    def test_report_is_sent_before_any_write_is_attempted(self):
+        """The write ranks are resolved before the setup that can raise, so a
+        failure between the two still reports every edge it owed. Resolving
+        them late leaves the original bug intact on that path."""
+        w, engine_id = _push_worker_writing_to(d_ranks=(0, 1))
+        w._logical_to_kernel_block_ids = MagicMock(side_effect=IndexError("no group"))
+        w._xfer_blocks = MagicMock()
+
+        with pytest.raises(IndexError):
+            w._xfer_blocks_for_req(req_id="p-req", meta=self._push_meta(engine_id))
+
+        assert w._xfer_blocks.call_count == 0
+        reported = [c.args[0] for c in w.nixl_wrapper.send_notif.call_args_list]
+        assert sorted(reported) == ["agent-0", "agent-1"]
 
     def test_failure_does_not_land_until_sibling_writes_have(self):
         """The property that makes this safe: failing on the first report
@@ -1298,10 +1328,22 @@ class TestPushWriteFailureReporting:
 
     def test_old_consumer_ignores_the_unknown_prefix(self, quiet_worker_log):
         """A peer that predates this change must degrade to today's hang, not
-        count the report and decode over a gap."""
-        w, _ = self._consumer(producer_tp_size=1)
-        w._pending_completion_notifs.put(b"PUSH_FAIL:d-req:1")
+        count the report and decode over a gap. Its whole parser is
+        ``rsplit(":", 1)``, so the prefix only fails safe if it stays glued to
+        the request id -- which is why it has to be a prefix and not a flag."""
+        p, engine_id = _push_worker_writing_to(d_ranks=(0,))
+        p._xfer_blocks = lambda **kw: None
+        p._xfer_blocks_for_req(req_id="p-req", meta=self._push_meta(engine_id))
+        (sent,) = [
+            c.kwargs["notif_msg"] for c in p.nixl_wrapper.send_notif.call_args_list
+        ]
 
+        # Exactly what an old peer does with these bytes: the id it recovers
+        # must not be a real request, or it would count the report.
+        assert sent.decode().rsplit(":", 1)[0] != "d-req"
+
+        w, _ = self._consumer(producer_tp_size=1)
+        w._pending_completion_notifs.put(sent)
         # Simulate the old code path: no prefix stripping.
         with patch.object(push_worker_module, "_PUSH_FAIL_PREFIX_STR", "\0unmatched\0"):
             w._get_new_notifs()
@@ -1314,9 +1356,7 @@ class TestPushWriteFailureReporting:
         """Selecting the transfer descriptors can raise before the WRITE is
         even attempted; unwinding there would leave every remaining edge both
         unattempted and unreported."""
-        w, engine_id = TestPushWriterMlaReplication._mla_worker_writing_to(
-            d_ranks=(0, 1)
-        )
+        w, engine_id = _push_worker_writing_to(d_ranks=(0, 1))
 
         def _raise_for_rank_1(**kw):
             if kw["read_spec"].remote_rank == 1:
@@ -1332,11 +1372,10 @@ class TestPushWriteFailureReporting:
         assert w._sending_transfers["p-req"] == [1000]
         w.nixl_wrapper.send_notif.assert_called_once()
         assert w.nixl_wrapper.send_notif.call_args.args[0] == "agent-1"
+        w.xfer_stats.record_failed_transfer.assert_called_once()
 
     def test_missing_agent_does_not_raise(self, quiet_worker_log):
-        w, engine_id = TestPushWriterMlaReplication._mla_worker_writing_to(
-            d_ranks=(0, 1)
-        )
+        w, engine_id = _push_worker_writing_to(d_ranks=(0, 1))
         w._remote_agents = {engine_id: {}}
         w._xfer_blocks = lambda **kw: None
 
@@ -1345,9 +1384,7 @@ class TestPushWriteFailureReporting:
         assert w.nixl_wrapper.send_notif.call_count == 0
 
     def test_send_notif_failure_does_not_raise(self, quiet_worker_log):
-        w, engine_id = TestPushWriterMlaReplication._mla_worker_writing_to(
-            d_ranks=(0, 1)
-        )
+        w, engine_id = _push_worker_writing_to(d_ranks=(0, 1))
         w.nixl_wrapper.send_notif.side_effect = RuntimeError("boom")
         w._xfer_blocks = lambda **kw: None
 
@@ -1360,25 +1397,33 @@ class TestPushWriteFailureReporting:
         self._feed(w, "d-req", tp, failed=True)
         assert "d-req" in w._failed_write_reqs
 
+        # An unrelated request retiring in the same step must not clear it:
+        # a request that loses its flag mid-count completes as a *successful*
+        # load over KV that was never written.
+        self._retire(w, {"other-req"})
+        assert "d-req" in w._failed_write_reqs
+
         # The lease expires and the base worker retires the request before
         # its second notif ever arrives.
+        self._retire(w, {"d-req"})
+        assert w._failed_write_reqs == set()
+
+    @staticmethod
+    def _retire(w, done_recving: set[str]) -> None:
+        """Drive one ``get_finished`` where the base worker retires requests."""
         with patch.object(
-            NixlPushConnectorWorker.__mro__[1],
+            NixlBaseConnectorWorker,
             "get_finished",
-            return_value=(set(), {"d-req"}),
+            return_value=(set(), set(done_recving)),
         ):
             w.get_finished()
-
-        assert w._failed_write_reqs == set()
 
     def test_report_travels_from_producer_to_consumer_unchanged(self):
         """Round-trip the real bytes. A body the consumer parses differently
         from what the producer wrote is silently catastrophic: too few fields
         raises out of the engine step, and a wrong TP size shrinks the expected
         count so the consumer acts while sibling WRITEs are still in flight."""
-        p, engine_id = TestPushWriterMlaReplication._mla_worker_writing_to(
-            d_ranks=(0, 1)
-        )
+        p, engine_id = _push_worker_writing_to(d_ranks=(0, 1))
         p.world_size = 2
         p._xfer_blocks = lambda **kw: None
 
@@ -1413,9 +1458,7 @@ class TestPushWriteFailureReporting:
         """If anything escapes the per-rank handler, the ranks the loop never
         reached must still be reported, or they are exactly as lost as the
         ones this fix exists to cover."""
-        w, engine_id = TestPushWriterMlaReplication._mla_worker_writing_to(
-            d_ranks=(0, 1)
-        )
+        w, engine_id = _push_worker_writing_to(d_ranks=(0, 1))
         w._xfer_blocks = lambda **kw: (_ for _ in ()).throw(RuntimeError("boom"))
         w._log_failure = MagicMock(side_effect=RuntimeError("logging is broken"))
 
@@ -1425,18 +1468,33 @@ class TestPushWriteFailureReporting:
         reported = [c.args[0] for c in w.nixl_wrapper.send_notif.call_args_list]
         assert sorted(reported) == ["agent-0", "agent-1"]
 
-    def test_evicted_engine_does_not_silently_drop_the_request(self, quiet_worker_log):
-        """``dst_xfer_side_handles`` is a defaultdict, so an engine evicted
-        mid-flight yields no ranks instead of raising. Reporting nothing is
-        the only safe choice (we cannot tell which ranks were owed), but it
-        must not look like a successful push."""
-        w, engine_id = TestPushWriterMlaReplication._mla_worker_writing_to(
-            d_ranks=(0, 1)
-        )
+    def test_engine_with_no_handshaked_ranks_is_not_a_silent_success(
+        self, quiet_worker_log
+    ):
+        """``dst_xfer_side_handles`` is a defaultdict, so it yields no ranks
+        instead of raising. Reporting nothing is the only safe choice (we
+        cannot tell which ranks were owed), but it must not look like a
+        successful push."""
+        w, engine_id = _push_worker_writing_to(d_ranks=(0, 1))
         w.dst_xfer_side_handles = defaultdict(dict)
         w._xfer_blocks = MagicMock()
 
         w._xfer_blocks_for_req(req_id="p-req", meta=self._push_meta(engine_id))
+
+        assert w._xfer_blocks.call_count == 0
+        assert w.nixl_wrapper.send_notif.call_count == 0
+        assert "p-req" not in w._sending_transfers
+
+    def test_evicted_engine_does_not_silently_drop_the_request(self, quiet_worker_log):
+        """Eviction pops ``tp_mappings`` (a plain dict), so the real shape is a
+        raise on the very first lookup. There is no agent left to report to,
+        but it must not look like a successful push either."""
+        w, engine_id = _push_worker_writing_to(d_ranks=(0, 1))
+        w.tp_mappings.pop(engine_id)
+        w._xfer_blocks = MagicMock()
+
+        with pytest.raises(KeyError):
+            w._xfer_blocks_for_req(req_id="p-req", meta=self._push_meta(engine_id))
 
         assert w._xfer_blocks.call_count == 0
         assert w.nixl_wrapper.send_notif.call_count == 0
