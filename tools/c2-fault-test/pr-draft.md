@@ -14,12 +14,6 @@ The prefill node now reports transfers it couldn't start, so the count adds up a
 
 The report is **counted like a normal notification** rather than failing the request straight away. When several prefill ranks feed the same decode rank, failing on the first report would release blocks while a sibling's transfer is still in flight — turning today's hang into silent corruption.
 
-## Question for @NickLucche
-
-I used a separate message type rather than a flag on the existing notification: an older peer ignores it and degrades to today's hang, whereas a flag it didn't understand would let it decode over a gap. This is the only thing that changes the wire format, so I'd like to agree it before going further. I also left the connector version alone, since a mismatch there is a hard handshake failure.
-
-Some cases are deliberately not covered — transfers that fail after starting, handshake failures, unresolvable ranks, and hybrid/multi-group models. Happy to expand on any of them.
-
 ## Test plan
 
 Added 10 unit tests. The 4 failures in the wider connector suite are pre-existing and reproduce on the base commit:
@@ -43,6 +37,8 @@ Both instances ran on one host, so this exercises the coordination logic rather 
 No model evaluation needed: this path only runs when a transfer fails to start, and cannot change output on any request that succeeds.
 
 ## Notes
+
+Some cases are deliberately not covered — transfers that fail after starting, handshake failures, unresolvable ranks, and hybrid/multi-group models. Happy to expand on any of them.
 
 Not a duplicate — the open PRs on #48633 cover stale remote cleanup and prefix caching. C2 is unclaimed and I asked for it on the issue.
 
