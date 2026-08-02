@@ -102,7 +102,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         self._sending_transfers_lock = threading.Lock()
 
         # D-side: requests where P reported a WRITE it could not post. Failed
-        # only once the count completes, so posted WRITEs have landed by then.
+        # only once the count completes, by when posted WRITEs have landed.
         self._failed_write_reqs: set[ReqId] = set()
 
         # Writer-thread owned matching state.
@@ -510,9 +510,9 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         engine_id = meta.remote.engine_id
 
         handles: list[int] = []
-        # D expects one notif per (producer rank -> consumer rank) edge and it
-        # rides on the WRITE, so unposted ranks must be reported. Unresolvable
-        # ones are not: a spurious notif finishes D's count mid-flight.
+        # One notif per (producer rank -> consumer rank) edge, riding on the
+        # WRITE: unposted ranks must be reported, unresolvable ones must not
+        # (a spurious notif finishes D's count while siblings are in flight).
         write_ranks: list[int] = []
         posted_ranks: set[int] = set()
         try:
@@ -520,8 +520,8 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             remote_info = self.transfer_topo.get_engine_info(engine_id)
             tp_ratio = self.transfer_topo.tp_ratio(remote_info.remote_tp_size)
 
-            # Resolved before anything that can raise below it, so a failure
-            # in the setup still knows which edges it owes a report.
+            # Resolved before anything that can raise, so the ``finally`` still
+            # knows which edges it owes a report.
             # MLA latent is replicated across D's TP ranks: the tp-mapping
             # collapses it to one rank (fine for reads), but push must WRITE
             # every D rank or the rest decode stale KV. For hybrid MLA+SSM the
@@ -536,7 +536,8 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 write_ranks = list(plan.all_source_ranks)
 
             if not write_ranks:
-                # defaultdict: an evicted engine yields no ranks, not a raise.
+                # ``dst_xfer_side_handles`` is a defaultdict, so an engine with
+                # no handshaked ranks yields an empty set rather than raising.
                 logger.error(
                     "No remote ranks to push request %s to on engine %s; its "
                     "consumer will hold its blocks until it is aborted",
@@ -585,47 +586,33 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                     remote_block_size,
                     req_id,
                 )
-                try:
-                    if tp_ratio < 0 and (
-                        not self.use_mla or len(plan.all_source_ranks) > 1
-                    ):
-                        # Multiple targets: write each rank its chunk of local
-                        # memory. Hybrid MLA+SSM also lands here: its split
-                        # handles replicate the attention descriptors and chunk
-                        # only the SSM state.
-                        split_key = (tp_ratio, remote_block_size)
-                        local_xfer_side_handle = self.src_xfer_handles_by_tp_ratio[
-                            split_key
-                        ][i]
-                    else:
-                        local_xfer_side_handle = self.src_xfer_handles_by_block_size[
-                            remote_block_size
-                        ]
-
-                    remote_xfer_side_handle = self.dst_xfer_side_handles[engine_id][
-                        spec.remote_rank
+                if tp_ratio < 0 and (
+                    not self.use_mla or len(plan.all_source_ranks) > 1
+                ):
+                    # Multiple targets: write each rank its chunk of local memory.
+                    # Hybrid MLA+SSM also lands here: its split handles replicate
+                    # the attention descriptors and chunk only the SSM state.
+                    split_key = (tp_ratio, remote_block_size)
+                    local_xfer_side_handle = self.src_xfer_handles_by_tp_ratio[
+                        split_key
+                    ][i]
+                else:
+                    local_xfer_side_handle = self.src_xfer_handles_by_block_size[
+                        remote_block_size
                     ]
 
-                    handle = self._xfer_blocks(
-                        read_spec=spec,
-                        request_id=req_id,
-                        dst_engine_id=engine_id,
-                        remote_request_id=meta.remote.request_id,
-                        local_xfer_side_handle=local_xfer_side_handle,
-                        remote_xfer_side_handle=remote_xfer_side_handle,
-                    )
-                except Exception as e:
-                    # Picking the descriptors can fail, not just the WRITE.
-                    self._log_failure(
-                        failure_type="transfer_setup_failed",
-                        req_id=req_id,
-                        error=e,
-                        dst_engine_id=engine_id,
-                        remote_rank=spec.remote_rank,
-                    )
-                    self.xfer_stats.record_failed_transfer()
-                    handle = None
+                remote_xfer_side_handle = self.dst_xfer_side_handles[engine_id][
+                    spec.remote_rank
+                ]
 
+                handle = self._xfer_blocks(
+                    read_spec=spec,
+                    request_id=req_id,
+                    dst_engine_id=engine_id,
+                    remote_request_id=meta.remote.request_id,
+                    local_xfer_side_handle=local_xfer_side_handle,
+                    remote_xfer_side_handle=remote_xfer_side_handle,
+                )
                 if handle is not None:
                     handles.append(handle)
                     posted_ranks.add(spec.remote_rank)
@@ -655,12 +642,6 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         Stands in for the completion notifs those WRITEs would have carried,
         so D's count still completes. Best-effort: a report that cannot be
         sent leaves D waiting, as it does today.
-
-        Args:
-            req_id: The local request id, for logging.
-            engine_id: Consumer engine the WRITEs were addressed to.
-            remote_request_id: The request id on the consumer.
-            failed_ranks: Consumer TP ranks whose WRITE was not posted.
         """
         notif_msg = (
             PUSH_FAIL_NOTIF_PREFIX + f"{remote_request_id}:{self.world_size}".encode()
@@ -806,7 +787,6 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 self._handle_heartbeat(msg[3:])
                 continue
 
-            # Same body as the completion notif it replaces; share the parse.
             failed_write = msg.startswith(_PUSH_FAIL_PREFIX_STR)
             if failed_write:
                 msg = msg[len(_PUSH_FAIL_PREFIX_STR) :]
@@ -819,8 +799,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 continue
 
             if failed_write:
-                # Only a consumer can act on this; counting it here would
-                # retire our own lease.
+                # Counting it here would retire our own lease.
                 logger.error(
                     "Ignoring failed-WRITE report for %s, which this worker is "
                     "itself producing",
@@ -848,14 +827,10 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         """Count one notif for a request this node is receiving.
 
         One notif is expected per producer rank writing here: pp_size stages
-        * producers-per-consumer. A failed WRITE reports in place of its
-        completion, so a failure never short-circuits the count and every
-        posted WRITE has landed by the time it finishes.
-
-        Args:
-            req_id: The local request id.
-            producer_tp_size: The producer's TP size, from the notif body.
-            failed_write: Whether this notif reports an unposted WRITE.
+        * producers-per-consumer, derived from ``producer_tp_size`` as carried
+        in the notif body. A failed WRITE reports in place of its completion,
+        so a failure never short-circuits the count and every posted WRITE has
+        landed by the time it finishes.
         """
         meta = self._recving_metadata.get(req_id)
         if meta is None:
@@ -885,30 +860,26 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         self._fail_incomplete_push(req_id, meta)
 
     def _fail_incomplete_push(self, req_id: str, meta: ReqMeta) -> None:
-        """Fail a request whose producer could not post every WRITE.
-
-        Args:
-            req_id: The local request id.
-            meta: Its recv metadata, checked for blocks to invalidate.
-        """
-        # ``_handle_failed_transfer`` only invalidates one group. With none
-        # recorded the scheduler treats this as a successful load, so skip.
+        """Fail a request whose producer could not post every WRITE."""
+        # ``_handle_failed_transfer`` invalidates one group only. With no
+        # blocks recorded the scheduler promotes the request as a successful
+        # load over a cache that was never written, so leave it to its lease.
         if self._is_hma_required or len(self.kv_cache_config.kv_cache_groups) > 1:
+            reason = "recovery is unsupported for hybrid or multi-group models"
+        elif not any(meta.local_block_ids):
+            reason = "it has no local blocks to invalidate"
+        else:
+            reason = None
+
+        if reason is not None:
             logger.error(
-                "Producer could not write all KV for request %s and recovery is "
-                "unsupported for hybrid or multi-group models; it will hold its "
-                "blocks until it is aborted",
+                "Producer could not write all KV for request %s and %s; it will "
+                "hold its blocks until it is aborted",
                 req_id,
+                reason,
             )
             return
-        if not any(meta.local_block_ids):
-            logger.error(
-                "Producer could not write all KV for request %s, which has no "
-                "local blocks to invalidate; it will hold its blocks until it "
-                "is aborted",
-                req_id,
-            )
-            return
+
         logger.warning(
             "Producer could not write all KV for request %s; failing it.", req_id
         )

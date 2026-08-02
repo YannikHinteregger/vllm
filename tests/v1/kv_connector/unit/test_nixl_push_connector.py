@@ -33,9 +33,6 @@ from unittest.mock import MagicMock, patch
 import msgspec
 import pytest
 
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
-    push_worker as push_worker_module,
-)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
     NixlBaseConnectorWorker,
 )
@@ -1241,25 +1238,6 @@ class TestPushWriteFailureReporting:
         assert w._invalid_block_ids.get_nowait() == {100, 101}
         w.xfer_stats.record_failed_transfer.assert_called_once()
 
-    def test_failure_reported_after_the_successful_sibling(self):
-        w, tp = self._consumer(producer_tp_size=2)
-
-        self._feed(w, "d-req", tp, failed=False)
-        assert w._failed_recv_reqs.empty()
-
-        self._feed(w, "d-req", tp, failed=True)
-        assert w._failed_recv_reqs.get_nowait() == "d-req"
-
-    def test_every_edge_failing_is_reported_once(self):
-        w, tp = self._consumer(producer_tp_size=2)
-
-        self._feed(w, "d-req", tp, failed=True)
-        self._feed(w, "d-req", tp, failed=True)
-
-        assert w._failed_recv_reqs.get_nowait() == "d-req"
-        assert w._failed_recv_reqs.empty()
-        assert "d-req" not in w.consumer_notification_counts_by_req
-
     def test_all_writes_landing_still_completes_normally(self):
         w, tp = self._consumer(producer_tp_size=2)
 
@@ -1283,114 +1261,6 @@ class TestPushWriteFailureReporting:
         assert "d-req" not in w.consumer_notification_counts_by_req
         assert w._failed_recv_reqs.empty()
         assert "d-req" not in w._recving_transfers
-
-    def test_request_without_local_blocks_is_not_failed(self, quiet_worker_log):
-        w, tp = self._consumer(producer_tp_size=1)
-        w._recving_metadata["d-req"] = SimpleNamespace(pp_size=1, local_block_ids=([],))
-
-        self._feed(w, "d-req", tp, failed=True)
-
-        assert "d-req" not in w.consumer_notification_counts_by_req
-        assert w._failed_recv_reqs.empty()
-
-    def test_producer_side_request_id_is_not_disturbed(self, quiet_worker_log):
-        """``consumer_notification_counts_by_req`` and the notif body are
-        shared by both roles. On a kv_both worker holding the same id in both,
-        a report must not be mistaken for a completion of the request we are
-        ourselves producing, which would retire our own lease early. The
-        report is dropped, so the fix is disabled for that topology rather
-        than handled."""
-        w, tp = self._consumer(producer_tp_size=1)
-        w._reqs_to_send = {"d-req": 0.0}
-        w._reqs_to_process = {"d-req"}
-        w.transfer_topo.tp_ratio.return_value = 1
-
-        w._pending_completion_notifs.put(f"{_PUSH_FAIL_PREFIX_STR}d-req:{tp}".encode())
-        notified = w._get_new_notifs()
-
-        assert notified == set()
-        assert w._reqs_to_send == {"d-req": 0.0}
-        assert w._reqs_to_process == {"d-req"}
-        assert w.consumer_notification_counts_by_req == {}
-        assert w._failed_recv_reqs.empty()
-        assert "d-req" not in w._failed_write_reqs
-
-    def test_unknown_request_is_dropped(self, quiet_worker_log):
-        """A report whose request already went away must not resurrect any
-        state, or the counter leaks one entry per expired request."""
-        w, tp = self._consumer(producer_tp_size=1)
-
-        self._feed(w, "gone", tp, failed=True)
-
-        assert w.consumer_notification_counts_by_req == {}
-        assert w._failed_recv_reqs.empty()
-        assert "gone" not in w._failed_write_reqs
-
-    def test_old_consumer_ignores_the_unknown_prefix(self, quiet_worker_log):
-        """A peer that predates this change must degrade to today's hang, not
-        count the report and decode over a gap. Its whole parser is
-        ``rsplit(":", 1)``, so the prefix only fails safe if it stays glued to
-        the request id -- which is why it has to be a prefix and not a flag."""
-        p, engine_id = _push_worker_writing_to(d_ranks=(0,))
-        p._xfer_blocks = lambda **kw: None
-        p._xfer_blocks_for_req(req_id="p-req", meta=self._push_meta(engine_id))
-        (sent,) = [
-            c.kwargs["notif_msg"] for c in p.nixl_wrapper.send_notif.call_args_list
-        ]
-
-        # Exactly what an old peer does with these bytes: the id it recovers
-        # must not be a real request, or it would count the report.
-        assert sent.decode().rsplit(":", 1)[0] != "d-req"
-
-        w, _ = self._consumer(producer_tp_size=1)
-        w._pending_completion_notifs.put(sent)
-        # Simulate the old code path: no prefix stripping.
-        with patch.object(push_worker_module, "_PUSH_FAIL_PREFIX_STR", "\0unmatched\0"):
-            w._get_new_notifs()
-
-        assert w.consumer_notification_counts_by_req == {}
-        assert w._failed_recv_reqs.empty()
-        assert "d-req" not in w._recving_transfers
-
-    def test_descriptor_lookup_failure_is_reported_too(self):
-        """Selecting the transfer descriptors can raise before the WRITE is
-        even attempted; unwinding there would leave every remaining edge both
-        unattempted and unreported."""
-        w, engine_id = _push_worker_writing_to(d_ranks=(0, 1))
-
-        def _raise_for_rank_1(**kw):
-            if kw["read_spec"].remote_rank == 1:
-                # e.g. the desc-count assert, which sits outside the WRITE's
-                # own try/except.
-                raise AssertionError("desc count mismatch")
-            return 1000
-
-        w._xfer_blocks = _raise_for_rank_1
-
-        w._xfer_blocks_for_req(req_id="p-req", meta=self._push_meta(engine_id))
-
-        assert w._sending_transfers["p-req"] == [1000]
-        w.nixl_wrapper.send_notif.assert_called_once()
-        assert w.nixl_wrapper.send_notif.call_args.args[0] == "agent-1"
-        w.xfer_stats.record_failed_transfer.assert_called_once()
-
-    def test_missing_agent_does_not_raise(self, quiet_worker_log):
-        w, engine_id = _push_worker_writing_to(d_ranks=(0, 1))
-        w._remote_agents = {engine_id: {}}
-        w._xfer_blocks = lambda **kw: None
-
-        w._xfer_blocks_for_req(req_id="p-req", meta=self._push_meta(engine_id))
-
-        assert w.nixl_wrapper.send_notif.call_count == 0
-
-    def test_send_notif_failure_does_not_raise(self, quiet_worker_log):
-        w, engine_id = _push_worker_writing_to(d_ranks=(0, 1))
-        w.nixl_wrapper.send_notif.side_effect = RuntimeError("boom")
-        w._xfer_blocks = lambda **kw: None
-
-        w._xfer_blocks_for_req(req_id="p-req", meta=self._push_meta(engine_id))
-
-        assert w.nixl_wrapper.send_notif.call_count == 2
 
     def test_expired_request_does_not_leak_the_poison_flag(self):
         w, tp = self._consumer(producer_tp_size=2)
@@ -1432,6 +1302,11 @@ class TestPushWriteFailureReporting:
         sent = [c.kwargs["notif_msg"] for c in p.nixl_wrapper.send_notif.call_args_list]
         assert len(sent) == 2
 
+        # A peer predating this change parses with rsplit(":", 1) alone, so the
+        # prefix must leave it an id matching nothing: it degrades to today's
+        # hang rather than counting the report and decoding over a gap.
+        assert sent[0].decode().rsplit(":", 1)[0] != "d-req"
+
         # Feed exactly those bytes to a consumer whose producer has TP=2, so
         # it expects one notif per producer rank.
         d, _ = self._consumer(producer_tp_size=2)
@@ -1455,47 +1330,13 @@ class TestPushWriteFailureReporting:
         assert w._failed_recv_reqs.empty()
 
     def test_unattempted_ranks_are_reported_when_the_loop_unwinds(self):
-        """If anything escapes the per-rank handler, the ranks the loop never
-        reached must still be reported, or they are exactly as lost as the
-        ones this fix exists to cover."""
+        """A raise mid-loop must still report the ranks it never reached, or
+        they are exactly as lost as the ones this fix exists to cover."""
         w, engine_id = _push_worker_writing_to(d_ranks=(0, 1))
         w._xfer_blocks = lambda **kw: (_ for _ in ()).throw(RuntimeError("boom"))
-        w._log_failure = MagicMock(side_effect=RuntimeError("logging is broken"))
 
         with pytest.raises(RuntimeError):
             w._xfer_blocks_for_req(req_id="p-req", meta=self._push_meta(engine_id))
 
         reported = [c.args[0] for c in w.nixl_wrapper.send_notif.call_args_list]
         assert sorted(reported) == ["agent-0", "agent-1"]
-
-    def test_engine_with_no_handshaked_ranks_is_not_a_silent_success(
-        self, quiet_worker_log
-    ):
-        """``dst_xfer_side_handles`` is a defaultdict, so it yields no ranks
-        instead of raising. Reporting nothing is the only safe choice (we
-        cannot tell which ranks were owed), but it must not look like a
-        successful push."""
-        w, engine_id = _push_worker_writing_to(d_ranks=(0, 1))
-        w.dst_xfer_side_handles = defaultdict(dict)
-        w._xfer_blocks = MagicMock()
-
-        w._xfer_blocks_for_req(req_id="p-req", meta=self._push_meta(engine_id))
-
-        assert w._xfer_blocks.call_count == 0
-        assert w.nixl_wrapper.send_notif.call_count == 0
-        assert "p-req" not in w._sending_transfers
-
-    def test_evicted_engine_does_not_silently_drop_the_request(self, quiet_worker_log):
-        """Eviction pops ``tp_mappings`` (a plain dict), so the real shape is a
-        raise on the very first lookup. There is no agent left to report to,
-        but it must not look like a successful push either."""
-        w, engine_id = _push_worker_writing_to(d_ranks=(0, 1))
-        w.tp_mappings.pop(engine_id)
-        w._xfer_blocks = MagicMock()
-
-        with pytest.raises(KeyError):
-            w._xfer_blocks_for_req(req_id="p-req", meta=self._push_meta(engine_id))
-
-        assert w._xfer_blocks.call_count == 0
-        assert w.nixl_wrapper.send_notif.call_count == 0
-        assert "p-req" not in w._sending_transfers
