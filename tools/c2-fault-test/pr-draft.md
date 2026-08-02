@@ -8,9 +8,9 @@ Paste everything below the rule. Fill the two link placeholders first.
 
 Fixes row **C2** of #48633.
 
-In push mode the prefill node writes KV straight into the decode node's memory. The decode node knows it has everything by counting the notifications that ride along. If the prefill node cannot start one of those transfers it just logs and moves on, so the decode node counts toward a number it never reaches. The request hangs until its lease expires while holding blocks over a half-written cache.
+**Problem:** In push mode the prefill node writes KV straight into the decode node's memory. The decode node knows it has everything by counting the notifications that ride along. If the prefill node cannot start one of those transfers it just logs and moves on, so the decode node counts toward a number it never reaches. The request hangs until its lease expires while holding blocks over a half-written cache.
 
-The prefill node now reports transfers it could not start, so the count adds up and the existing KV load failure policy can take over.
+**Solution:** This PR introduces a new NIXL message that the prefill node sends when it cannot start a transfer. The decode node then still receives the number of messages it expects, so instead of waiting forever it can tell that one of the transfers failed. When that happens it falls back to the existing KV load failure policy, which either fails the request or recomputes the KV locally.
 
 ## Test plan
 
