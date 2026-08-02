@@ -12,8 +12,6 @@ In push mode the prefill node writes KV straight into the decode node's memory, 
 
 The prefill node now reports transfers it couldn't start, so the count adds up and the existing KV load failure policy can take over.
 
-The report is **counted like a normal notification** rather than failing the request straight away. When several prefill ranks feed the same decode rank, failing on the first report would release blocks while a sibling's transfer is still in flight — turning today's hang into silent corruption.
-
 ## Test plan
 
 Added 10 unit tests. The 4 failures in the wider connector suite are pre-existing and reproduce on the base commit:
