@@ -111,6 +111,10 @@ class SimpleCPUOffloadWorker:
 
         # Metadata for the current step
         self._connector_metadata: SimpleCPUOffloadMetadata | None = None
+        # Per-bind submission guards: some runner paths skip start_load_kv or
+        # wait_for_save, so get_finished re-drives submission idempotently.
+        self._loads_submitted = False
+        self._stores_submitted = False
 
         # Compute-done event recorded before each store; reused across steps
         # (get_finished runs once per step, copy queue is FIFO).
@@ -321,6 +325,8 @@ class SimpleCPUOffloadWorker:
 
     def bind_connector_metadata(self, metadata: SimpleCPUOffloadMetadata) -> None:
         self._connector_metadata = metadata
+        self._loads_submitted = False
+        self._stores_submitted = False
         if metadata.load_event >= 0:
             self._pending_load_event_indices.add(metadata.load_event)
         if metadata.store_event >= 0:
@@ -334,8 +340,14 @@ class SimpleCPUOffloadWorker:
         # (SchedulerOutput.has_sync_kv_loads), so the CPU-side block copy
         # op overhead (~5ms) stays hidden behind GPU compute. Stores are
         # issued in wait_for_save().
+        self._submit_loads()
+
+    def _submit_loads(self) -> None:
         metadata = self._connector_metadata
-        if metadata is not None and metadata.load_cpu_blocks:
+        if metadata is None or self._loads_submitted:
+            return
+        self._loads_submitted = True
+        if metadata.load_cpu_blocks:
             backend = self._backend
             assert backend is not None
             backend.launch_copy(
@@ -347,6 +359,9 @@ class SimpleCPUOffloadWorker:
             )
 
     def wait_for_save(self) -> None:
+        self._submit_stores()
+
+    def _submit_stores(self) -> None:
         """Submit async stores.
 
         Stores (GPU->CPU) read the live KV cache, which the compute stream may
@@ -355,7 +370,10 @@ class SimpleCPUOffloadWorker:
         #45704 for the bug and #39306 for the srcAccessOrder rationale.
         """
         metadata = self._connector_metadata
-        if metadata is not None and metadata.store_gpu_blocks:
+        if metadata is None or self._stores_submitted:
+            return
+        self._stores_submitted = True
+        if metadata.store_gpu_blocks:
             backend = self._backend
             assert backend is not None
             if self._store_compute_done is None:
@@ -384,6 +402,12 @@ class SimpleCPUOffloadWorker:
         """
         metadata = self._connector_metadata
         finished_recving: set[str] = set()
+
+        # Catch-all: runner paths that skip start_load_kv or wait_for_save
+        # (e.g. no_forward) would otherwise strand this step's transfers as
+        # forever-pending events, pinning their blocks scheduler-side.
+        self._submit_loads()
+        self._submit_stores()
 
         _now = time.monotonic()
         if _now - getattr(self, "_dbg_last_gf", 0.0) > 3.0:
