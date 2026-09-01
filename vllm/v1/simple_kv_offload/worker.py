@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Worker-side handler for SimpleCPUOffloadConnector."""
 
+import math
+import mmap
 import time
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -39,14 +41,30 @@ def _allocate_cpu_caches(
     pin_memory: bool,
     chunk_size_bytes: int | None = None,
 ) -> _CpuCaches:
-    """Allocate zeroed CPU tensors and page-lock them via cudaHostRegister."""
+    """Allocate zeroed CPU tensors and page-lock them via cudaHostRegister.
+
+    Chunked registration splits a tensor into multiple pinned regions, and
+    cuMemcpyBatchAsync rejects a copy range spanning two regions. So tensors
+    are allocated page-aligned and cut only at multiples of
+    lcm(block_row_bytes, page_size), keeping every block row inside one
+    region.
+    """
+    page_size = mmap.PAGESIZE
     tensors: dict[str, torch.Tensor] = {}
     registered: list[int] = []
     try:
         for name, (shape, dtype) in plan.items():
-            tensor = torch.zeros(shape, dtype=dtype, device="cpu")
+            row_bytes = math.prod(shape[1:]) * dtype.itemsize
+            nbytes = shape[0] * row_bytes
+            raw = torch.zeros(nbytes + page_size, dtype=torch.int8, device="cpu")
+            offset = -raw.data_ptr() % page_size
+            tensor = raw[offset : offset + nbytes].view(dtype).view(shape)
             if pin_memory:
-                registered += pin_tensor(tensor, chunk_size_bytes)
+                chunk = chunk_size_bytes
+                if chunk is not None:
+                    quantum = math.lcm(row_bytes, page_size)
+                    chunk = max(quantum, chunk // quantum * quantum)
+                registered += pin_tensor(tensor, chunk)
             tensors[name] = tensor
     except BaseException:
         host_unregister(registered)
