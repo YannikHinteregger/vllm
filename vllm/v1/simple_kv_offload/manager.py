@@ -3,6 +3,7 @@
 """Scheduler-side manager for SimpleCPUOffloadConnector."""
 
 import contextlib
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
@@ -246,6 +247,18 @@ class SimpleCPUOffloadScheduler:
         self, request: "Request", num_computed_tokens: int
     ) -> tuple[int | None, bool]:
         """Return (num_new_tokens, is_async) from consecutive CPU cache hits."""
+
+        _now = time.monotonic()
+        if _now - getattr(self, "_dbg_last_match", 0.0) > 3.0:
+            self._dbg_last_match = _now
+            logger.info(
+                "DBG mgr.match: pending_events=%d pending_counts=%d "
+                "pending_cpu_hits=%d cpu_free_blocks=%d",
+                len(self._store_event_to_blocks),
+                len(self._store_event_pending_counts),
+                len(self._pending_cpu_hits),
+                self.cpu_block_pool.get_num_free_blocks(),
+            )
 
         # Pins found CPU blocks so they survive LRU eviction until
         # update_state_after_alloc() consumes them. Any pin from an earlier
@@ -675,6 +688,18 @@ class SimpleCPUOffloadScheduler:
         per-event worker counts. We accumulate across steps and process
         a store event only when all workers have reported completion.
         """
+        meta_dbg = connector_output.kv_connector_worker_meta
+        _now = time.monotonic()
+        if meta_dbg is not None or _now - getattr(self, "_dbg_last_uco", 0.0) > 3.0:
+            self._dbg_last_uco = _now
+            logger.info(
+                "DBG mgr.uco: recv=%d meta=%s completed=%s pending_events=%d",
+                len(connector_output.finished_recving or []),
+                type(meta_dbg).__name__,
+                getattr(meta_dbg, "completed_store_events", None),
+                len(self._store_event_to_blocks),
+            )
+
         # --- Load completions ---
         for req_id in list(connector_output.finished_recving or []):
             self._cleanup_load_request(req_id)

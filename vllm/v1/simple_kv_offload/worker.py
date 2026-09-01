@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Worker-side handler for SimpleCPUOffloadConnector."""
 
+import time
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
@@ -384,6 +385,21 @@ class SimpleCPUOffloadWorker:
         metadata = self._connector_metadata
         finished_recving: set[str] = set()
 
+        _now = time.monotonic()
+        if _now - getattr(self, "_dbg_last_gf", 0.0) > 3.0:
+            self._dbg_last_gf = _now
+            logger.info(
+                "DBG wrk.get_finished: meta=%s pend_load=%d pend_store=%d "
+                "inflight_load=%d inflight_store=%d store_hwm=%d completed=%d",
+                metadata is not None,
+                len(self._pending_load_event_indices),
+                len(self._pending_store_event_indices),
+                len(self._load_events),
+                len(self._store_events),
+                self._store_hwm,
+                len(self._completed_store_events),
+            )
+
         if self._pending_load_event_indices:
             load_wm = self._poll_stream_events(is_store=False)
             for j in [j for j in self._pending_load_event_indices if j <= load_wm]:
@@ -406,6 +422,9 @@ class SimpleCPUOffloadWorker:
         """Return completed store events since the last call."""
         if not self._completed_store_events:
             return None
+        logger.info(
+            "DBG wrk.meta: reporting completed=%s", self._completed_store_events
+        )
         meta = SimpleCPUOffloadWorkerMetadata(
             completed_store_events=self._completed_store_events,
         )
