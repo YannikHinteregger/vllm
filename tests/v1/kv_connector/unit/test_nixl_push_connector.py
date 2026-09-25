@@ -49,7 +49,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     ReqMeta,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
-    _PUSH_FAIL_PREFIX_STR,
     NixlPushConnectorWorker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.stats import (
@@ -385,14 +384,9 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         w._remote_agents = {}
         w._handshake_lock = threading.RLock()
 
-        # Failed-WRITE reporting state (_count_consumer_notif ->
-        # _fail_incomplete_push -> _handle_failed_transfer).
-        w._failed_write_reqs = set()
-        w._failed_recv_reqs = queue.Queue()
+        w._write_notifs_by_req = defaultdict(list)
         w._invalid_block_ids = queue.Queue()
-        w._is_hma_required = False
         w.kv_cache_config = SimpleNamespace(kv_cache_groups=[object()])
-        w.xfer_stats = MagicMock()
         w._physical_blocks_per_logical_kv_block = 1
         w._uses_region_group_mapping = False
         w.region_group_ids = [0]
@@ -1091,6 +1085,7 @@ class TestPushWriterNotifs:
             remote_request_id="decode-request",
             local_xfer_side_handle=1,
             remote_xfer_side_handle=2,
+            unconfirmed_ranks=set(),
         )
         assert handle == (101 if release_fails else None)
         w._sending_transfers[request_id] = [102]
@@ -1438,13 +1433,13 @@ class TestPushPipelineParallel:
         w._pending_completion_notifs.put(notif)
         assert w._get_new_notifs() == set()
         assert request_id not in w._recving_transfers
-        assert w.consumer_notification_counts_by_req[request_id] == 1
+        assert w._write_notifs_by_req[request_id] == [False]
 
         # Second (final) stage: now reported done.
         w._pending_completion_notifs.put(notif)
         assert w._get_new_notifs() == set()
         assert request_id in w._recving_transfers
-        assert request_id not in w.consumer_notification_counts_by_req
+        assert request_id not in w._write_notifs_by_req
 
     def test_req_meta_reads_pp_size_from_kv_transfer_params(self):
         """D learns the producer's pp_size from kv_transfer_params (forwarded
@@ -2145,7 +2140,6 @@ def test_layer_handshake_rejects_unsupported_geometry(
         worker.transfer_topo.get_engine_info(metadata.engine_id)
 
 
-
 @pytest.fixture
 def quiet_worker_log(caplog):
     """These paths log at ERROR by design; keep it out of the test report."""
@@ -2156,15 +2150,11 @@ def quiet_worker_log(caplog):
 
 
 class TestPushWriteFailureReporting:
-    """A WRITE that is never posted carries no completion notif, so without a
-    stand-in the consumer counts forever and the request hangs until its lease
-    expires. P reports the shortfall; D counts the report like any other notif
-    and only then fails the request."""
+    """Report unposted WRITEs without finishing D before sibling WRITEs land."""
 
     @staticmethod
     def _consumer(*, producer_tp_size: int = 2, pp_size: int = 1):
-        w = _StubWriterWorker.fresh()
-        w.transfer_topo = MagicMock()
+        w = TestPushWriterNotifs._pollable_worker()
         w._recving_metadata = {
             "d-req": SimpleNamespace(pp_size=pp_size, local_block_ids=([100, 101],))
         }
@@ -2187,16 +2177,14 @@ class TestPushWriteFailureReporting:
 
     @staticmethod
     def _feed(w, req_id: str, producer_tp_size: int, *, failed: bool) -> None:
-        body = f"{req_id}:{producer_tp_size}"
-        msg = f"{_PUSH_FAIL_PREFIX_STR}{body}" if failed else body
-        w._pending_completion_notifs.put(msg.encode())
+        body = f"{req_id}:{producer_tp_size}".encode()
+        msg = PUSH_FAIL_NOTIF_PREFIX + body if failed else body
+        w._pending_completion_notifs.put(msg)
         w._get_new_notifs()
 
     @pytest.mark.parametrize("use_mla", [True, False])
     def test_producer_reports_the_rank_whose_write_was_not_posted(self, use_mla):
-        """Both branches that resolve the write ranks must report: MLA's
-        fan-out to every handshaked rank, and the tp-mapping's source ranks
-        that every other model goes through."""
+        """Report missing WRITEs for both MLA replication and sharded KV."""
         w, engine_id = _push_worker_writing_to(d_ranks=(0, 1), use_mla=use_mla)
         # Rank 1's submission fails; rank 0's succeeds.
         w._xfer_blocks = lambda **kw: (
@@ -2205,19 +2193,13 @@ class TestPushWriteFailureReporting:
 
         w._xfer_blocks_for_req(req_id="p-req", meta=self._push_meta(engine_id))
 
-        # The surviving WRITE is still tracked, so P's own accounting is intact.
         assert w._sending_transfers["p-req"] == [1000]
-        # ...and only the failed rank is told.
-        w.nixl_wrapper.send_notif.assert_called_once()
-        call = w.nixl_wrapper.send_notif.call_args
-        assert call.args[0] == "agent-1"
-        assert call.kwargs["notif_msg"].startswith(PUSH_FAIL_NOTIF_PREFIX)
-        assert b"d-req" in call.kwargs["notif_msg"]
+        w.nixl_wrapper.send_notif.assert_called_once_with(
+            "agent-1", notif_msg=b"PUSH_FAIL:d-req:1"
+        )
 
     def test_report_is_sent_before_any_write_is_attempted(self):
-        """The write ranks are resolved before the setup that can raise, so a
-        failure between the two still reports every edge it owed. Resolving
-        them late leaves the original bug intact on that path."""
+        """Descriptor setup errors must report all required destinations."""
         w, engine_id = _push_worker_writing_to(d_ranks=(0, 1))
         w._logical_to_kernel_block_ids = MagicMock(side_effect=IndexError("no group"))
         w._xfer_blocks = MagicMock()
@@ -2229,28 +2211,37 @@ class TestPushWriteFailureReporting:
         reported = [c.args[0] for c in w.nixl_wrapper.send_notif.call_args_list]
         assert sorted(reported) == ["agent-0", "agent-1"]
 
-    def test_failure_does_not_land_until_sibling_writes_have(self):
-        """The property that makes this safe: failing on the first report
-        would free blocks while a sibling producer's RDMA WRITE is still in
-        flight, landing it in another request's KV."""
-        w, tp = self._consumer(producer_tp_size=2)
+    @pytest.mark.parametrize("failure_first", [True, False])
+    @pytest.mark.parametrize("pp_size", [1, 2])
+    def test_failure_waits_for_sibling_writes(self, failure_first, pp_size):
+        """Neither notification order may free KV while another WRITE is pending."""
+        w, tp = self._consumer(producer_tp_size=2, pp_size=pp_size)
+        outcomes = [True] + [False] * (tp * pp_size - 1)
+        if not failure_first:
+            outcomes.reverse()
 
-        self._feed(w, "d-req", tp, failed=True)
-        # One of two edges reported. Nothing may be decided yet.
-        assert w._failed_recv_reqs.empty()
-        assert w.consumer_notification_counts_by_req["d-req"] == 1
+        for failed in outcomes[:-1]:
+            self._feed(w, "d-req", tp, failed=failed)
+            results = w.get_transfer_results()
+            assert results.finished_recving == set()
+            assert results.failed_recving == set()
+            assert w.get_block_ids_with_load_errors() == set()
+            assert "d-req" in w._recving_metadata
 
-        self._feed(w, "d-req", tp, failed=False)
-        assert w._failed_recv_reqs.get_nowait() == "d-req"
-        assert "d-req" not in w.consumer_notification_counts_by_req
-        assert "d-req" not in w._failed_write_reqs
-        # The request must not also be reported as a successful receive.
+        self._feed(w, "d-req", tp, failed=outcomes[-1])
+        results = w.get_transfer_results()
+        assert results.finished_recving == {"d-req"}
+        assert results.failed_recving == {"d-req"}
+        assert w.get_block_ids_with_load_errors() == {100, 101}
+        assert "d-req" not in w._recving_metadata
+        assert "d-req" not in w._write_notifs_by_req
         assert "d-req" not in w._recving_transfers
-        # The blocks must be invalidated: an empty set makes the scheduler
-        # promote the request as a successful load over a cache that was
-        # never written.
-        assert w._invalid_block_ids.get_nowait() == {100, 101}
+        assert w._recv_failures == set()
         w.xfer_stats.record_failed_transfer.assert_called_once()
+
+        results = w.get_transfer_results()
+        assert results.finished_recving == results.failed_recving == set()
+        assert w.get_block_ids_with_load_errors() == set()
 
     def test_all_writes_landing_still_completes_normally(self):
         w, tp = self._consumer(producer_tp_size=2)
@@ -2261,96 +2252,95 @@ class TestPushWriteFailureReporting:
         assert w._failed_recv_reqs.empty()
         assert "d-req" in w._recving_transfers
 
-    def test_multi_group_models_are_left_to_the_lease(self, quiet_worker_log):
-        """``_handle_failed_transfer`` cannot invalidate blocks across groups,
-        and the scheduler would then promote a partially written cache as a
-        successful load. Hanging is the lesser evil."""
+    @pytest.mark.parametrize("is_hma", [True, False])
+    def test_multi_group_recovery_remains_out_of_scope(self, is_hma, quiet_worker_log):
         w, tp = self._consumer(producer_tp_size=1)
-        w._is_hma_required = True
-
-        self._feed(w, "d-req", tp, failed=True)
-
-        # The count completed, so this is a deliberate no-op rather than a
-        # notif we failed to recognise.
-        assert "d-req" not in w.consumer_notification_counts_by_req
-        assert w._failed_recv_reqs.empty()
-        assert "d-req" not in w._recving_transfers
-
-    def test_expired_request_does_not_leak_the_poison_flag(self):
-        w, tp = self._consumer(producer_tp_size=2)
-        self._feed(w, "d-req", tp, failed=True)
-        assert "d-req" in w._failed_write_reqs
-
-        # An unrelated request retiring in the same step must not clear it:
-        # a request that loses its flag mid-count completes as a *successful*
-        # load over KV that was never written.
-        self._retire(w, {"other-req"})
-        assert "d-req" in w._failed_write_reqs
-
-        # The lease expires and the base worker retires the request before
-        # its second notif ever arrives.
-        self._retire(w, {"d-req"})
-        assert w._failed_write_reqs == set()
-
-    @staticmethod
-    def _retire(w, done_recving: set[str]) -> None:
-        """Drive one ``get_finished`` where the base worker retires requests."""
-        with patch.object(
-            NixlBaseConnectorWorker,
-            "get_finished",
-            return_value=(set(), set(done_recving)),
-        ):
-            w.get_finished()
-
-    def test_report_travels_from_producer_to_consumer_unchanged(self):
-        """Round-trip the real bytes. A body the consumer parses differently
-        from what the producer wrote is silently catastrophic: too few fields
-        raises out of the engine step, and a wrong TP size shrinks the expected
-        count so the consumer acts while sibling WRITEs are still in flight."""
-        p, engine_id = _push_worker_writing_to(d_ranks=(0, 1))
-        p.world_size = 2
-        p._xfer_blocks = lambda **kw: None
-
-        p._xfer_blocks_for_req(req_id="p-req", meta=self._push_meta(engine_id))
-
-        sent = [c.kwargs["notif_msg"] for c in p.nixl_wrapper.send_notif.call_args_list]
-        assert len(sent) == 2
-
-        # A peer predating this change parses with rsplit(":", 1) alone, so the
-        # prefix must leave it an id matching nothing: it degrades to today's
-        # hang rather than counting the report and decoding over a gap.
-        assert sent[0].decode().rsplit(":", 1)[0] != "d-req"
-
-        # Feed exactly those bytes to a consumer whose producer has TP=2, so
-        # it expects one notif per producer rank.
-        d, _ = self._consumer(producer_tp_size=2)
-        d.world_size = 1
-        d._pending_completion_notifs.put(sent[0])
-        d._get_new_notifs()
-        assert d._failed_recv_reqs.empty(), "acted before both edges reported"
-
-        d._pending_completion_notifs.put(sent[1])
-        d._get_new_notifs()
-        assert d._failed_recv_reqs.get_nowait() == "d-req"
-
-    def test_multiple_groups_without_hma_are_also_gated(self, quiet_worker_log):
-        w, tp = self._consumer(producer_tp_size=1)
-        w._is_hma_required = False
+        w._is_hma_required = is_hma
         w.kv_cache_config = SimpleNamespace(kv_cache_groups=[object(), object()])
 
         self._feed(w, "d-req", tp, failed=True)
 
-        assert "d-req" not in w.consumer_notification_counts_by_req
-        assert w._failed_recv_reqs.empty()
+        results = w.get_transfer_results()
+        assert "d-req" not in w._write_notifs_by_req
+        assert results.finished_recving == results.failed_recving == set()
+        assert "d-req" in w._recving_metadata
+
+    def test_retired_request_does_not_leak_the_failure_flag(self):
+        w, tp = self._consumer(producer_tp_size=2)
+        self._feed(w, "d-req", tp, failed=True)
+
+        self._retire(w, {"other-req"})
+        assert w._write_notifs_by_req["d-req"] == [True]
+
+        self._retire(w, {"d-req"})
+        assert "d-req" not in w._write_notifs_by_req
+
+    @staticmethod
+    def _retire(w, done_recving: set[str]) -> None:
+        """Simulate an independent receive failure reported by the base worker."""
+        with patch.object(
+            NixlBaseConnectorWorker,
+            "get_transfer_results",
+            return_value=KVConnectorTransferResults(finished_recving=done_recving),
+        ):
+            w.get_transfer_results()
+
+    def test_report_travels_from_producer_to_consumer_unchanged(self):
+        """Two producer ranks report preparation failures to the same D rank."""
+        sent = []
+        for rank in range(2):
+            p, engine_id = TestPushPrefixCaching._worker_driving_xfer()
+            p.world_size = 2
+            p.tp_rank = rank
+            p._remote_agents = {engine_id: {(0, 0): "agent-0"}}
+            p.nixl_wrapper.make_prepped_xfer.side_effect = RuntimeError("prep failed")
+            p._xfer_blocks_for_req(req_id="p-req", meta=self._push_meta(engine_id))
+            p.nixl_wrapper.transfer.assert_not_called()
+            p.nixl_wrapper.send_notif.assert_called_once()
+            assert not p._sending_transfers
+            sent.append(p.nixl_wrapper.send_notif.call_args.kwargs["notif_msg"])
+
+        # Old peers must not mistake a failure notification for successful KV.
+        assert sent[0].decode().rsplit(":", 1)[0] != "d-req"
+
+        d, _ = self._consumer(producer_tp_size=2)
+        d._pending_completion_notifs.put(sent[0])
+        assert d.get_transfer_results().finished_recving == set()
+
+        d._pending_completion_notifs.put(sent[1])
+        results = d.get_transfer_results()
+        assert results.finished_recving == results.failed_recving == {"d-req"}
 
     def test_unattempted_ranks_are_reported_when_the_loop_unwinds(self):
-        """A raise mid-loop must still report the ranks it never reached, or
-        they are exactly as lost as the ones this fix exists to cover."""
-        w, engine_id = _push_worker_writing_to(d_ranks=(0, 1))
-        w._xfer_blocks = lambda **kw: (_ for _ in ()).throw(RuntimeError("boom"))
+        """Track earlier WRITEs if a later destination's setup raises."""
+        w, engine_id = _push_worker_writing_to(d_ranks=(0, 1, 2))
+        w._xfer_blocks = MagicMock(side_effect=[1000, RuntimeError("boom")])
 
         with pytest.raises(RuntimeError):
             w._xfer_blocks_for_req(req_id="p-req", meta=self._push_meta(engine_id))
 
         reported = [c.args[0] for c in w.nixl_wrapper.send_notif.call_args_list]
-        assert sorted(reported) == ["agent-0", "agent-1"]
+        assert sorted(reported) == ["agent-1", "agent-2"]
+        assert w._sending_transfers["p-req"] == [1000]
+
+    @pytest.mark.parametrize("release_fails", [False, True])
+    def test_uncertain_submission_does_not_send_a_second_notification(
+        self, release_fails
+    ):
+        """A transfer() exception can still be followed by a completion notif."""
+        w, engine_id = TestPushPrefixCaching._worker_driving_xfer()
+        w._remote_agents = {engine_id: {(0, 0): "agent-0"}}
+        w.nixl_wrapper.transfer.side_effect = RuntimeError("submission failed")
+        if release_fails:
+            w.nixl_wrapper.release_xfer_handle.side_effect = RuntimeError(
+                "still active"
+            )
+
+        w._xfer_blocks_for_req(req_id="p-req", meta=self._push_meta(engine_id))
+
+        w.nixl_wrapper.send_notif.assert_not_called()
+        w.nixl_wrapper.release_xfer_handle.assert_called_once_with(7)
+        if release_fails:
+            assert w._sending_transfers["p-req"] == [7]
+        else:
+            assert not w._sending_transfers

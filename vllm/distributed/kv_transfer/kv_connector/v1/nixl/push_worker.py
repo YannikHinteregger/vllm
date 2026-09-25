@@ -110,9 +110,9 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         self._send_failures: set[ReqId] = set()
         self._sending_transfers_lock = threading.Lock()
 
-        # D-side: requests where P reported a WRITE it could not post. Failed
-        # only once the count completes, by when posted WRITEs have landed.
-        self._failed_write_reqs: set[ReqId] = set()
+        # D-side: one entry per WRITE notif received, True if P reported that
+        # WRITE as not posted. Both the count and the failure derive from it.
+        self._write_notifs_by_req = defaultdict[ReqId, list[bool]](list)
 
         # Writer-thread owned matching state.
         # P-side: finished request blocks received from scheduler metadata
@@ -544,8 +544,9 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         write_ranks = self._resolve_write_ranks(req_id, engine_id)
 
         posted: dict[int, TransferHandle] = {}
+        unconfirmed_ranks: set[int] = set()
         try:
-            self._post_writes(req_id, meta, write_ranks, posted)
+            self._post_writes(req_id, meta, write_ranks, posted, unconfirmed_ranks)
         finally:
             # Publish all the request's WRITE handles in one locked update: a
             # partial set would let ``_pop_done_transfers`` finish the request
@@ -554,7 +555,11 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 with self._sending_transfers_lock:
                     self._sending_transfers[req_id].extend(posted.values())
 
-            failed_ranks = [rank for rank in write_ranks if rank not in posted]
+            failed_ranks = [
+                rank
+                for rank in write_ranks
+                if rank not in posted and rank not in unconfirmed_ranks
+            ]
             if failed_ranks:
                 self._notify_push_failure(
                     req_id, engine_id, meta.remote.request_id, failed_ranks
@@ -598,6 +603,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         meta: ReqMeta,
         write_ranks: list[int],
         posted: dict[int, TransferHandle],
+        unconfirmed_ranks: set[int],
     ) -> None:
         """Submit one WRITE per rank in *write_ranks*, recording those posted."""
         assert meta.remote is not None and self.transfer_topo is not None
@@ -677,6 +683,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 remote_request_id=meta.remote.request_id,
                 local_xfer_side_handle=local_xfer_side_handle,
                 remote_xfer_side_handle=remote_xfer_side_handle,
+                unconfirmed_ranks=unconfirmed_ranks,
             )
             if handle is not None:
                 posted[spec.remote_rank] = handle
@@ -721,6 +728,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                     error=e,
                     remote_rank=rank,
                 )
+                self.xfer_stats.record_failed_notification()
 
     def _xfer_blocks(
         self,
@@ -730,11 +738,13 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         remote_request_id: str,
         local_xfer_side_handle: int,
         remote_xfer_side_handle: int,
+        unconfirmed_ranks: set[int],
     ) -> int | None:
         """Post a WRITE point-to-point xfer request.
 
         Returns the in-flight transfer handle (so the caller can track all of
-        a request's handles atomically), or ``None`` if nothing was submitted.
+        a request's handles atomically), or ``None`` after cleanup. If submission
+        was attempted, record an uncertain outcome in ``unconfirmed_ranks``.
         """
         assert self.transfer_topo is not None
         remote_rank = read_spec.remote_rank
@@ -818,6 +828,11 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             # writes) so P can free blocks once all of them are done.
             return handle
         except Exception as e:
+            if handle is not None:
+                # transfer() may have started a WRITE before raising. Even if
+                # release succeeds, its completion notif could already be in
+                # flight, so a PUSH_FAIL would risk counting this rank twice.
+                unconfirmed_ranks.add(remote_rank)
             self._log_failure(
                 failure_type="transfer_setup_failed",
                 req_id=request_id,
@@ -910,33 +925,31 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             logger.error("Unrecognized request %s notif (may have expired).", req_id)
             return
 
-        if failed_write:
-            self._failed_write_reqs.add(req_id)
-
         producers_per_consumer = max(1, producer_tp_size // self.world_size)
         expected_notifs = meta.pp_size * producers_per_consumer
-        self.consumer_notification_counts_by_req[req_id] += 1
-        if self.consumer_notification_counts_by_req[req_id] < expected_notifs:
+        notifs = self._write_notifs_by_req[req_id]
+        notifs.append(failed_write)
+        if len(notifs) < expected_notifs:
             return
 
-        del self.consumer_notification_counts_by_req[req_id]
-        if req_id not in self._failed_write_reqs:
+        del self._write_notifs_by_req[req_id]
+        if not any(notifs):
             # P drove the transfer (we own no NIXL handle), so materialise an
             # empty ``_recving_transfers`` entry for ``_pop_done_transfers``
             # to report done.
             self._recving_transfers.setdefault(req_id, [])
             return
 
-        self._failed_write_reqs.discard(req_id)
         self._fail_incomplete_push(req_id, meta)
 
     def _fail_incomplete_push(self, req_id: str, meta: ReqMeta) -> None:
         """Fail a request whose producer could not post every WRITE."""
-        # ``_handle_failed_transfer`` invalidates one group only. With no
-        # blocks recorded the scheduler promotes the request as a successful
-        # load over a cache that was never written, so leave it to its lease.
+        # Keep this recovery path scoped to a single non-hybrid cache group.
+        # The base worker still emits flat invalid block IDs for non-HMA failures.
         if self._is_hma_required or len(self.kv_cache_config.kv_cache_groups) > 1:
-            reason = "recovery is unsupported for hybrid or multi-group models"
+            reason = (
+                "PUSH_FAIL recovery is not enabled for hybrid or multi-group models"
+            )
         elif not any(meta.local_block_ids):
             reason = "it has no local blocks to invalidate"
         else:
@@ -954,7 +967,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         logger.warning(
             "Producer could not write all KV for request %s; failing it.", req_id
         )
-        self._handle_failed_transfer(req_id, None)
+        self._handle_failed_transfer(req_id, None, self._recv_failures)
 
     def get_transfer_results(self) -> KVConnectorTransferResults:
         # Engine main thread asking for completions: also wake the writer
@@ -965,8 +978,9 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         results = super().get_transfer_results()
         done_sending = results.finished_sending
 
-        # A request retired before its count completed would leak its flag.
-        self._failed_write_reqs.difference_update(results.finished_recving)
+        # Independent receive failures can retire a request mid-count.
+        for req_id in results.finished_recving:
+            self._write_notifs_by_req.pop(req_id, None)
 
         # ``_pop_done_transfers`` mutates ``_sending_transfers``; the
         # writer thread also appends to it, so guard the pop.
