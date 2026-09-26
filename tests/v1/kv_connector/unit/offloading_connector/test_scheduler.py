@@ -15,9 +15,14 @@ from tests.v1.kv_connector.unit.offloading_connector.utils import (
     generate_store_output,
     to_keys,
 )
-from tests.v1.kv_connector.unit.utils import EOS_TOKEN_ID
+from tests.v1.kv_connector.unit.utils import (
+    EOS_TOKEN_ID,
+    create_model_runner_output,
+    create_request,
+)
 from vllm.config import KVEventsConfig
 from vllm.distributed.kv_events import MEDIUM_CPU, BlockRemoved, BlockStored
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRankInitStatus
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingConnectorMetadata,
     OffloadingWorkerMetadata,
@@ -3558,6 +3563,72 @@ def test_multiple_in_flight_stores_all_flushed_by_fence(request_runner):
     # Post-condition: fence cleaned up, all jobs gone.
     assert runner.connector_scheduler._block_id_to_pending_jobs == {}
     assert len(runner.connector_scheduler._jobs) == 0
+
+
+def test_switchover_flushes_stores_before_gpu_only_request_reuses_blocks(
+    request_runner,
+):
+    """A request admitted before the connector is ready stays GPU-only for its
+    whole life, so the connector does not track it. After the switchover it can
+    still be allocated blocks that an offloaded request just freed while their
+    stores to CPU are in flight. Those stores must be flushed before the block
+    is reused, or the offloaded copy mixes both requests' KV.
+    """
+    block_size = 4
+    # Null block + 2 blocks per request: once `offloaded` finishes, its blocks
+    # are the only free ones.
+    runner = request_runner(
+        block_size=block_size,
+        num_gpu_blocks=5,
+        async_scheduling=False,
+        blocks_per_chunk=1,
+    )
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    scheduler = runner.scheduler
+    connector = scheduler.connector
+
+    def step() -> SchedulerOutput:
+        output = scheduler.schedule()
+        scheduler.update_from_output(
+            output, create_model_runner_output(reqs=list(scheduler.running))
+        )
+        return output
+
+    def gpu_only_blocks() -> set[int]:
+        return set(scheduler.kv_cache_manager.get_block_ids(gpu_only.request_id)[0])
+
+    # Given a request admitted before the connector was ready, still running
+    # after the switchover
+    connector.enable_async_init()
+    gpu_only = create_request(
+        request_id=1, num_tokens=block_size, max_tokens=100, block_size=block_size
+    )
+    scheduler.add_request(gpu_only)
+    step()
+    connector.update_connector_init_status(KVConnectorRankInitStatus(ready_ranks={0}))
+
+    # And an offloaded request that finished with its stores still in flight
+    offloaded = create_request(
+        request_id=2, num_tokens=2 * block_size, max_tokens=1, block_size=block_size
+    )
+    scheduler.add_request(offloaded)
+    offloaded_blocks = set(step().scheduled_new_reqs[0].block_ids[0])
+    step()
+    in_flight = dict(runner.connector_scheduler._block_id_to_pending_jobs)
+    assert in_flight.keys() == offloaded_blocks
+
+    # When the GPU-only request fills its current block and is given a freed one
+    for _ in range(block_size - 2):
+        step()
+    blocks_before = gpu_only_blocks()
+    output = step()
+    (reused_block,) = gpu_only_blocks() - blocks_before
+    assert reused_block in offloaded_blocks
+
+    # Then the stores still reading that block are flushed before it is reused
+    assert in_flight[reused_block].issubset(output.kv_connector_metadata.jobs_to_flush)
 
 
 def test_request_finished_mixed_full_attn_and_sliding_window(
