@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -291,9 +291,30 @@ class SchedulerOutput:
     # Scheduler-local; always None by the time this reaches a worker.
     kv_connector_block_state: KVConnectorBlockState | None = None
 
+    # Blocks newly allocated to requests dropped by `without_requests`. A
+    # connector that ignores those requests still needs these to detect reuse
+    # of blocks it is transferring.
+    hidden_new_block_ids: set[int] = field(default_factory=set)
+
     # Dynamic speculative decoding: optimal K chosen by scheduler.
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
+
+    def _new_block_ids_of(self, req_ids: set[str]) -> set[int]:
+        """Blocks newly allocated this step to `req_ids`, across all KV groups."""
+        block_ids: set[int] = set()
+        # First-time requests carry all their blocks.
+        for req in self.scheduled_new_reqs:
+            if req.req_id in req_ids:
+                for group in req.block_ids:
+                    block_ids.update(group)
+        # Running requests carry only this step's blocks, or None.
+        cached = self.scheduled_cached_reqs
+        for req_id, new_block_ids in zip(cached.req_ids, cached.new_block_ids):
+            if req_id in req_ids and new_block_ids is not None:
+                for group in new_block_ids:
+                    block_ids.update(group)
+        return block_ids
 
     def without_requests(self, excluded: set[str]) -> "SchedulerOutput":
         """A copy with `excluded` request ids dropped from every request view.
@@ -302,6 +323,8 @@ class SchedulerOutput:
         """
         if not excluded:
             return self
+
+        hidden_block_ids = self.hidden_new_block_ids | self._new_block_ids_of(excluded)
 
         cached = self.scheduled_cached_reqs
         num_cached = len(cached.req_ids)
@@ -335,6 +358,7 @@ class SchedulerOutput:
                 r for r in self.scheduled_new_reqs if r.req_id not in excluded
             ],
             scheduled_cached_reqs=cached,
+            hidden_new_block_ids=hidden_block_ids,
             num_scheduled_tokens=num_scheduled_tokens,
             total_num_scheduled_tokens=sum(num_scheduled_tokens.values()),
             finished_req_ids=self.finished_req_ids - excluded,
