@@ -132,6 +132,8 @@ class _NotifTally:
     """Transfer notifs that each sender agent still owes for one request."""
 
     owed_by_sender: dict[str, int] = field(default_factory=dict)
+    # Whether a sender reported a transfer it could not post.
+    any_failed: bool = False
 
     @property
     def num_done_senders(self) -> int:
@@ -3373,6 +3375,7 @@ class NixlBaseConnectorWorker:
         if owed == 0:
             return None
         tally.owed_by_sender[sender] = owed - 1
+        tally.any_failed |= notif.failed
         if tally.num_done_senders < notif.expected_senders:
             return None
         return self._notif_tallies.pop(notif.request_id)

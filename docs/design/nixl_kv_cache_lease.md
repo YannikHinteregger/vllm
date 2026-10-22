@@ -105,8 +105,16 @@ The side that waits for a transfer counts its notifications. P counts READ notif
 
 - `expected_senders`: how many peer workers the receiver waits for.
 - `num_transfers`: how many transfers this sender posts to the receiver for the request. Every notification from one sender declares the same number.
+- `failed`: set when the notification stands in for a transfer that could not be posted.
 
 Each posted transfer carries its notification as its NIXL completion notification. A split READ (a HiSparse read posts one READ per DRAM and device slice) thus yields one notification per READ. A sender with nothing to transfer (a full local cache hit, an empty DCP slice or an unused MLA replica) sends one notification with `num_transfers` set to 0. The receiver counts notifications per sending agent. The request is done once `expected_senders` senders have sent all of theirs.
+
+A transfer that could not be posted still owes its notification, so the sender sends a `failed` one in its place. This also covers the sibling READs D skips after one READ of a request fails. The receiver counts it like a completion and acts only once every notification has arrived, so no posted transfer can still be in flight:
+
+- Pull: P frees its blocks.
+- Push: D fails the request instead of completing it.
+
+A READ whose handle could not be released gets no placeholder, since it may still complete and send its own notification. In push mode no WRITE whose submission started gets one either, as it may still land in D's blocks. A transfer that fails after it was posted sends no notification at all, so the receiver falls back to the lease.
 
 ## Bidirectional KV Transfer
 

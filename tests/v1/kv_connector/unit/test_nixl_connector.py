@@ -12,6 +12,7 @@ import time
 import uuid
 from collections import defaultdict
 from concurrent.futures import Future
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import MagicMock, call, patch
@@ -2231,6 +2232,19 @@ def test_pull_notifs_retire_readers_independently():
     assert worker._get_new_notifs() == {"req"}
 
 
+def test_pull_notifs_wait_for_posted_read_after_failed_one():
+    """A failed notif for one half of a split READ must not free P's blocks
+    while the posted half may still be reading them."""
+    worker = _pull_notif_stub()
+
+    worker.nixl_wrapper.get_new_notifs = lambda: {"d0": [b"req:1:2:1"]}
+    assert worker._get_new_notifs() == set()
+    assert "req" in worker._reqs_to_process
+
+    worker.nixl_wrapper.get_new_notifs = lambda: {"d0": [b"req:1:2:0"]}
+    assert worker._get_new_notifs() == {"req"}
+
+
 def test_pull_notifs_ignore_notifs_beyond_declared_count():
     """Extra notifs from a reader must not stand in for another reader."""
     worker = _pull_notif_stub()
@@ -2641,6 +2655,44 @@ def test_mixed_memory_read_failure_does_not_notify_producer(recv_worker):
 
     assert worker.get_block_ids_with_load_errors() == {1, 2, 3}
     worker.nixl_wrapper.send_notif.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("release_fails", "retained", "notifs"),
+    [(False, [101], [b"request:1:2:1"]), (True, [101, 102], [])],
+)
+def test_mixed_memory_read_reports_unposted_transfer(
+    recv_worker, release_fails, retained, notifs
+):
+    """A split READ half that fails to post gets a failed notif in its place,
+    unless its handle is retained and may still complete on its own."""
+    worker = recv_worker
+    worker._desc_is_dram_by_block_size = {16: np.array([True, True, False, False])}
+    worker._desc_pos_by_block_size = {16: np.array([0, 1, 0, 1])}
+    worker.nixl_wrapper.make_prepped_xfer.side_effect = [101, 102]
+    worker.nixl_wrapper.transfer.side_effect = [None, RuntimeError("post")]
+    if release_fails:
+        worker.nixl_wrapper.release_xfer_handle.side_effect = RuntimeError("release")
+
+    with pytest.raises(RuntimeError, match="post"):
+        worker._read_blocks_mixed(
+            request_id="request",
+            local_block_size_key=16,
+            local_device_handle=20,
+            local_dram_handle=10,
+            remote_xfer_side_handle=30,
+            local_block_descs_ids=np.array([0, 2]),
+            remote_block_descs_ids=np.array([5, 7]),
+            notif_agent="prefill",
+            remote_request_id="request",
+            expected_consumers=1,
+        )
+
+    assert worker._recving_transfers["request"] == retained
+    assert [
+        sent.kwargs["notif_msg"]
+        for sent in worker.nixl_wrapper.send_notif.call_args_list
+    ] == notifs
 
 
 def test_hisparse_dram_rank0_only_read_keeps_device_part(recv_worker):
@@ -4331,6 +4383,64 @@ def test_transfer_setup_failure_returns_finished(
     assert results.failed_recving == {request_id}
     invalid_blocks = connector.get_block_ids_with_load_errors()
     assert invalid_blocks == (set() if is_hma else {7, 8, 9})
+
+
+@patch(
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
+    FailingNixlWrapper,
+)
+def test_transfer_setup_failure_notifies_every_producer(default_vllm_config, dist_init):
+    """With P TP > D TP, a READ that fails to post sends its producer a failed
+    notif, and so does the sibling READ it leaves unposted."""
+    block_size = maybe_update_block_size(16)
+    vllm_config = create_vllm_config(block_size=block_size)
+    connector = NixlConnector(
+        vllm_config,
+        KVConnectorRole.WORKER,
+        make_kv_cache_config(block_size=block_size),
+    )
+    connector.connector_worker = FakeNixlConnectorWorker(
+        vllm_config, connector.engine_id, hand_shake_latency=0
+    )
+    worker = connector.connector_worker
+    worker.nixl_wrapper.fail_transfer_setup = True
+    worker.nixl_wrapper.send_notif = MagicMock()
+
+    metadata = NixlConnectorMetadata()
+    metadata.add_new_req_to_recv(
+        request_id="req",
+        local_block_ids=([7, 8, 9],),
+        kv_transfer_params={
+            "remote_block_ids": ([10, 11, 12],),
+            "remote_engine_id": FakeNixlConnectorWorker.REMOTE_ENGINE_ID,
+            "remote_request_id": "prefill-req",
+            "remote_host": "localhost",
+            "remote_port": 1234,
+        },
+    )
+    connector.bind_connector_metadata(metadata)
+    dummy_ctx = ForwardContext(no_compile_layers={}, attn_metadata={}, slot_mapping={})
+    connector.start_load_kv(dummy_ctx)
+    time.sleep(0.1)
+
+    # Let this D rank read from two P ranks once the handshake is done.
+    engine_id = FakeNixlConnectorWorker.REMOTE_ENGINE_ID
+    worker.tp_mappings[engine_id] = replace(
+        worker.tp_mappings[engine_id],
+        source_ranks_per_group=((0, 1),),
+        all_source_ranks=(0, 1),
+    )
+    worker._remote_agents[engine_id][(0, 1)] = "remote_agent_1"
+    connector.bind_connector_metadata(NixlConnectorMetadata())
+    connector.start_load_kv(dummy_ctx)
+
+    assert [
+        (sent.args[0], sent.kwargs["notif_msg"])
+        for sent in worker.nixl_wrapper.send_notif.call_args_list
+    ] == [
+        (FakeNixlWrapper.REMOTE_AGENT_NAME, b"prefill-req:1:1:1"),
+        ("remote_agent_1", b"prefill-req:1:0:1"),
+    ]
 
 
 class _ScriptedXferWrapper(FakeNixlWrapper):

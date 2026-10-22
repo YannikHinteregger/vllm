@@ -3,6 +3,7 @@
 """Pull-specific (READ) worker-side logic for the NIXL connector."""
 
 import time
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -321,6 +322,20 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         if self.use_mla and tp_ratio < 0 and not self._has_mamba and not dcp_active:
             assert len(read_specs) == 1
 
+        remote_agents = self._remote_agents[meta.remote.engine_id]
+        if self.use_mla and tp_ratio < 0 and len(read_specs) == 1:
+            # ..but we still need to notify the other remote ranks that we
+            # have the blocks we need so they can update the request state.
+            # Same thing for DCP (tp_size == dcp_size), so the raw tp_ratio already
+            # reflects whether any remote replica is left unchosen. Acked
+            # before reading, since they are never read whatever the outcome.
+            ack = TransferNotif(
+                meta.remote.request_id, plan.local_consumers, num_transfers=0
+            )
+            for rank_to_notify, agent in remote_agents.items():
+                if rank_to_notify != (0, read_specs[0].remote_rank):
+                    self._send_read_notif(req_id, agent, ack)
+
         for i, spec in enumerate(read_specs):
             remote_block_size = remote_info.remote_block_size
             logger.debug(
@@ -361,7 +376,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
 
             # Once a read routes the request to failure reporting, the
             # scheduler may free and reuse its blocks, so no sibling READs
-            # may be posted (and P must not be notified).
+            # may be posted. Their producers get a failed notif instead.
             if not self._read_blocks(
                 read_spec=spec,
                 request_id=req_id,
@@ -373,20 +388,16 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 expected_consumers=plan.local_consumers,
                 awaiting_kvs=meta.awaiting_kvs,
             ):
+                skipped = TransferNotif(
+                    meta.remote.request_id,
+                    plan.local_consumers,
+                    num_transfers=0,
+                    failed=True,
+                )
+                for sibling in read_specs[i + 1 :]:
+                    agent = remote_agents[(0, sibling.remote_rank)]
+                    self._send_read_notif(req_id, agent, skipped)
                 return
-
-        if self.use_mla and tp_ratio < 0 and len(read_specs) == 1:
-            # ..but we still need to notify the other remote ranks that we
-            # have the blocks we need so they can update the request state.
-            # Same thing for DCP (tp_size == dcp_size), so the raw tp_ratio already
-            # reflects whether any remote replica is left unchosen.
-            ack = TransferNotif(
-                meta.remote.request_id, plan.local_consumers, num_transfers=0
-            )
-            remote_agents = self._remote_agents[meta.remote.engine_id]
-            for rank_to_notify, agent in remote_agents.items():
-                if rank_to_notify != (0, read_specs[0].remote_rank):
-                    self._send_read_notif(req_id, agent, ack)
 
     def _send_read_notif(
         self, request_id: str, agent_name: str, notif: TransferNotif
@@ -576,6 +587,18 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             ):
                 assert handle is not None
                 self._recving_transfers[request_id].append(handle)
+            elif not self._mixed_mem_types:
+                # NIXL will never report this READ, so P gets a failed notif.
+                self._send_read_notif(
+                    request_id,
+                    self._remote_agents[dst_engine_id][(0, remote_rank)],
+                    TransferNotif(
+                        remote_request_id,
+                        expected_consumers,
+                        num_transfers=1,
+                        failed=True,
+                    ),
+                )
             return False
 
     def _read_blocks_mixed(
@@ -624,10 +647,11 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             )
             return
 
-        notif_msg = TransferNotif(
+        notif = TransferNotif(
             remote_request_id, expected_consumers, num_transfers=len(reads)
-        ).encode()
+        )
         handles: list[int] = []
+        num_posted = 0
         try:
             for mask, local_handle in reads:
                 handles.append(
@@ -637,24 +661,24 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                         desc_pos[local_ids[mask]],
                         remote_xfer_side_handle,
                         remote_ids[mask],
-                        notif_msg=notif_msg,
+                        notif_msg=notif.encode(),
                     )
                 )
-        except Exception:
             for handle in handles:
+                self.nixl_wrapper.transfer(handle)
+                self._recving_transfers[request_id].append(handle)
+                num_posted += 1
+        except Exception:
+            num_retained = 0
+            for handle in handles[num_posted:]:
                 if not self._try_release_xfer_handle(request_id, handle):
                     self._recving_transfers[request_id].append(handle)
+                    num_retained += 1
+            # A retained handle may still complete and send its own notif.
+            failed = replace(notif, failed=True)
+            for _ in range(len(reads) - num_posted - num_retained):
+                self._send_read_notif(request_id, notif_agent, failed)
             raise
-
-        for i, handle in enumerate(handles):
-            try:
-                self.nixl_wrapper.transfer(handle)
-            except Exception:
-                for unstarted in handles[i:]:
-                    if not self._try_release_xfer_handle(request_id, unstarted):
-                        self._recving_transfers[request_id].append(unstarted)
-                raise
-            self._recving_transfers[request_id].append(handle)
 
     def _get_new_notifs(self) -> set[str]:
         """Get req_ids which got a remote xfer message. When multiple consumers
