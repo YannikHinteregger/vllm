@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
+from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.kv_cache_interface import MambaSpec, SlidingWindowSpec
 from vllm.v1.metrics.stats import KV_FETCH_STAGES
 from vllm.v1.outputs import (
@@ -159,6 +160,35 @@ def test_basic_lifecycle():
     output = outputs[0]
     assert output.finish_reason == FinishReason.STOP
     assert_scheduler_empty(scheduler)
+
+
+def test_keep_pause_steps_until_remote_kv_arrives():
+    """A paused D must keep stepping while a read is in flight: NIXL notifies
+    P of a READ only once a worker polls it done."""
+    vllm_config = create_vllm_config()
+    scheduler = create_scheduler(vllm_config)
+    BLOCK_SIZE = vllm_config.cache_config.block_size
+    request = create_request(
+        request_id=1,
+        block_size=BLOCK_SIZE,
+        num_tokens=BLOCK_SIZE * 2,
+        do_remote_prefill=True,
+    )
+    scheduler.add_request(request)
+    scheduler_output = scheduler.schedule()
+    scheduler.update_from_output(scheduler_output, EMPTY_MODEL_RUNNER_OUTPUT)
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+
+    scheduler.set_pause_state(PauseState.PAUSED_ALL)
+    assert scheduler.has_requests()
+
+    scheduler_output = scheduler.schedule()
+    model_runner_output = copy.deepcopy(EMPTY_MODEL_RUNNER_OUTPUT)
+    model_runner_output.kv_connector_output = KVConnectorOutput(
+        finished_recving={request.request_id}
+    )
+    scheduler.update_from_output(scheduler_output, model_runner_output)
+    assert not scheduler.has_requests()
 
 
 def test_interleaved_lifecycle():

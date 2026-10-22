@@ -116,6 +116,8 @@ A transfer that could not be posted still owes its notification, so the sender s
 
 A READ whose handle could not be released gets no placeholder, since it may still complete and send its own notification. In push mode no WRITE whose submission started gets one either, as it may still land in D's blocks. A transfer that fails after it was posted sends no notification at all, so the receiver falls back to the lease.
 
+NIXL sends a completion notification only once the initiator checks the transfer state. In pull mode the initiator is D, so a paused D keeps stepping while any of its reads are in flight. Otherwise P would hold the blocks until the lease expires.
+
 ## Bidirectional KV Transfer
 
 For multi-turn conversations, [bidirectional KV transfer](../features/disagg_prefill.md) allows D to cache KV blocks that P can pull from on subsequent turns. Since the timing of the next conversational turn is **client-dependent** (not controlled by the system), the heartbeat-based lease mechanism does not apply here. Instead, a separate `decoder_kv_blocks_ttl` (default 480s) provides a simple fixed timeout for blocks cached on D. If the client takes too long to continue the conversation, the blocks expire. D communicates back the expiry time so P can know when blocks are expired and recompute. Because the deadline is a `perf_counter` value produced on D and the two engines run in separate processes (with unrelated clocks), P estimates the clock offset to D from the handshake round-trip and applies it before comparing the deadline against its own `perf_counter`. Future work may extend a symmetric heartbeat mechanism to this case.
