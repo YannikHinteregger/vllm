@@ -14,6 +14,7 @@ import uuid
 from collections import defaultdict
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
 import msgspec
@@ -45,6 +46,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     ReqId,
     ReqMeta,
     TransferHandle,
+    TransferNotif,
     compute_nixl_compatibility_hash,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.stats import (
@@ -123,6 +125,17 @@ def _share_storage_and_block_stride(caches: list[torch.Tensor]) -> bool:
     block_strides = {cache.stride(0) * cache.element_size() for cache in caches}
     storage_ptrs = {cache.untyped_storage().data_ptr() for cache in caches}
     return len(block_strides) == len(storage_ptrs) == 1
+
+
+@dataclass
+class _NotifTally:
+    """Transfer notifs that each sender agent still owes for one request."""
+
+    owed_by_sender: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def num_done_senders(self) -> int:
+        return sum(owed == 0 for owed in self.owed_by_sender.values())
 
 
 class NixlBaseConnectorWorker:
@@ -932,7 +945,6 @@ class NixlBaseConnectorWorker:
         # background handshake thread, matching the _ready_requests pattern.
         self._failed_recv_reqs: queue.Queue[ReqId] = queue.Queue()
         self._recv_failures: set[ReqId] = set()
-        self._pending_recv_notifs: dict[ReqId, list[tuple[str, bytes]]] = {}
 
         # Handshake metadata of this worker for NIXL transfers.
         self.xfer_handshake_metadata: NixlHandshakePayload | None = None
@@ -980,10 +992,10 @@ class NixlBaseConnectorWorker:
         self.compat_hash: str | None = None
         self.transfer_topo: TransferTopology | None = None
 
-        # With heterogeneous TP (or DCP), P must wait for all assigned D
-        # workers to finish reading before safely freeing the blocks.
-        self.consumer_notification_counts_by_req = defaultdict[ReqId, int](int)
-        self.expected_consumer_notifications_by_req: dict[ReqId, int] = {}
+        # Transfer notifs counted by the side that waits for them: P for READs
+        # in pull, D for WRITEs in push. With heterogeneous TP (or DCP) a
+        # request has several senders, and each may post several transfers.
+        self._notif_tallies: dict[ReqId, _NotifTally] = {}
         self.xfer_stats = NixlKVConnectorStats()
 
         self._physical_blocks_per_logical_kv_block = 1
@@ -3246,7 +3258,6 @@ class NixlBaseConnectorWorker:
 
             # Skip KV sync and post-processing for failed requests
             if req_id in failed_recv_reqs:
-                self._pending_recv_notifs.pop(req_id, None)
                 # TODO (NickLucche) handle failed transfer for HMA.
                 if not self._is_hma_required:
                     self._invalid_block_ids.put(set(meta.local_block_ids[0]))
@@ -3256,7 +3267,6 @@ class NixlBaseConnectorWorker:
                 )
                 continue
 
-            self._send_pending_recv_notifs(req_id)
             assert meta.remote is not None
             if self.use_host_buffer:
                 self.sync_recved_kv_to_device(req_id, meta)
@@ -3349,6 +3359,24 @@ class NixlBaseConnectorWorker:
         """
         raise NotImplementedError
 
+    def _count_transfer_notif(
+        self, sender: str, notif: TransferNotif
+    ) -> _NotifTally | None:
+        """Count one transfer notif from *sender*.
+
+        Returns the request's tally once every expected sender has sent all of
+        its notifs, else None.
+        """
+        tally = self._notif_tallies.setdefault(notif.request_id, _NotifTally())
+        # A sender with nothing to transfer sends exactly one notif.
+        owed = tally.owed_by_sender.setdefault(sender, max(1, notif.num_transfers))
+        if owed == 0:
+            return None
+        tally.owed_by_sender[sender] = owed - 1
+        if tally.num_done_senders < notif.expected_senders:
+            return None
+        return self._notif_tallies.pop(notif.request_id)
+
     def _reap_expired_send_leases(self, done_sending: set[str]) -> None:
         """Reclaim expired send-side KV leases into ``done_sending``.
 
@@ -3364,14 +3392,13 @@ class NixlBaseConnectorWorker:
             req_id for req_id, expires in self._reqs_to_send.items() if now >= expires
         ]
         for req_id in expired:
-            count = self.consumer_notification_counts_by_req.pop(req_id, 0)
-            self.expected_consumer_notifications_by_req.pop(req_id, None)
+            tally = self._notif_tallies.pop(req_id, None)
             self.xfer_stats.record_kv_expired_req()
             logger.warning(
                 "Releasing expired KV blocks for request %s which were "
                 "retrieved by %d remote worker(s) before lease expired.",
                 req_id,
-                count,
+                tally.num_done_senders if tally is not None else 0,
             )
             self._reqs_to_process.remove(req_id)
             del self._reqs_to_send[req_id]
@@ -3497,22 +3524,6 @@ class NixlBaseConnectorWorker:
         if failed_req_ids is not None:
             failed_req_ids.add(req_id)
         return handle is None or self._try_release_xfer_handle(req_id, handle)
-
-    def _send_pending_recv_notifs(self, req_id: str) -> None:
-        """Send notifications deferred by split DRAM/VRAM reads."""
-        for agent_name, notif_id in self._pending_recv_notifs.pop(req_id, []):
-            try:
-                self.nixl_wrapper.send_notif(agent_name, notif_msg=notif_id)
-            except Exception as e:
-                self._log_failure(
-                    failure_type="notification_failed",
-                    msg="P worker blocks will be freed after timeout. "
-                    "This may indicate network issues.",
-                    req_id=req_id,
-                    error=e,
-                    remote_agent_name=agent_name,
-                )
-                self.xfer_stats.record_failed_notification()
 
     def _send_heartbeats(self, metadata: NixlConnectorMetadata) -> None:
         """Send heartbeats to remote engines, extending the lease on KV blocks."""

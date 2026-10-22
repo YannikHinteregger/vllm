@@ -58,7 +58,7 @@ class TPMapping:
     rank_offset_factor: int
 
     # Local ranks (in aggregate) that read from a given source rank. The producer frees
-    # a request's blocks only once that many notifications have come in.
+    # a request's blocks only once that many readers sent all of their notifs.
     local_consumers: int = 1
 
 

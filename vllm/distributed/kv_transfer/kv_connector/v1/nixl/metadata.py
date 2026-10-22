@@ -51,8 +51,37 @@ PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
 #  13: Add packed-member layouts and order-independent packed-push backend hashes
 #  14: Add Qwen3.8-Flash-Next PLE page length - #59997
 #  15: Add remote_registration_generation to kv_transfer_params
+#  16: Count transfer notifs per transfer and flag transfers that failed to post
 #
-NIXL_CONNECTOR_VERSION: int = 15
+NIXL_CONNECTOR_VERSION: int = 16
+
+
+@dataclass(frozen=True)
+class TransferNotif:
+    """Notif for one READ or WRITE, sent to the peer at the other end.
+
+    A posted transfer carries it as its NIXL completion notif. A transfer that
+    could not be posted is replaced by a ``failed`` one, and a sender with
+    nothing to transfer sends one with ``num_transfers=0``. Every notif from a
+    sender for a request declares the same ``num_transfers``.
+    """
+
+    request_id: str
+    expected_senders: int
+    num_transfers: int
+    failed: bool = False
+
+    def encode(self) -> bytes:
+        return (
+            f"{self.request_id}:{self.expected_senders}:"
+            f"{self.num_transfers}:{int(self.failed)}"
+        ).encode()
+
+    @classmethod
+    def decode(cls, msg: str) -> "TransferNotif":
+        # Request ids may contain ':'.
+        request_id, expected_senders, num_transfers, failed = msg.rsplit(":", 3)
+        return cls(request_id, int(expected_senders), int(num_transfers), failed == "1")
 
 
 @dataclass

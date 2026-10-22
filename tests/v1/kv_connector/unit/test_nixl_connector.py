@@ -1030,14 +1030,16 @@ class TestNixlHandshake:
         conn_p1.connector_worker._reqs_to_send[req_id] = now + 10.0
         conn_p1.connector_worker._reqs_to_process.add(req_id)
 
-        # Simulate a read notification coming from D with (tp=1, dp=2).
-        notif = f"{req_id}:{d_tp_size}".encode()
+        # Simulate the notifs coming from D (tp=1): the rank D read from gets
+        # its READ notif, the unused MLA replica a zero-transfer ack.
+        read_notif = f"{req_id}:{d_tp_size}:1:0".encode()
+        ack_notif = f"{req_id}:{d_tp_size}:0:0".encode()
         # D0-0->P0 notif
         conn_p0.connector_worker.nixl_wrapper.get_new_notifs = lambda: {
-            "agent": [notif]
+            "agent": [read_notif]
         }  # type: ignore[method-assign]
         conn_p1.connector_worker.nixl_wrapper.get_new_notifs = lambda: {
-            "agent": [notif]
+            "agent": [ack_notif]
         }  # type: ignore[method-assign]
 
         # Trigger notification processing via get_finished().
@@ -2177,7 +2179,7 @@ def test_notification_after_expiry_is_counted(default_vllm_config, dist_init):
     worker._reqs_to_process.add("known")
     worker._reqs_to_send["known"] = time.perf_counter() + 10
     worker.nixl_wrapper.get_new_notifs = MagicMock(
-        return_value={"decode-agent": [b"known:1", b"unknown:1"]}
+        return_value={"decode-agent": [b"known:1:1:0", b"unknown:1:1:0"]}
     )
 
     assert worker._get_new_notifs() == {"known"}
@@ -2185,6 +2187,59 @@ def test_notification_after_expiry_is_counted(default_vllm_config, dist_init):
     stats = connector.get_kv_connector_stats()
     assert isinstance(stats, NixlKVConnectorStats)
     assert stats.data["num_notifications_after_expiry"] == [1]
+
+
+def _pull_notif_stub() -> NixlConnectorWorker:
+    """Producer-side stub exposing only the state ``_get_new_notifs`` reads."""
+    worker = object.__new__(NixlConnectorWorker)
+    worker.transfer_topo = MagicMock()
+    worker._reqs_to_send = {"req": time.perf_counter() + 10}
+    worker._reqs_to_process = {"req"}
+    worker._notif_tallies = {}
+    worker.xfer_stats = NixlKVConnectorStats()
+    worker.nixl_wrapper = MagicMock()
+    return worker
+
+
+def test_pull_notifs_count_transfers_per_reader():
+    """A reader that splits its READ is done only once both READs landed."""
+    worker = _pull_notif_stub()
+
+    worker.nixl_wrapper.get_new_notifs = lambda: {"d0": [b"req:1:2:0"]}
+    assert worker._get_new_notifs() == set()
+    assert "req" in worker._reqs_to_process
+
+    assert worker._get_new_notifs() == {"req"}
+    assert "req" not in worker._reqs_to_process
+    assert "req" not in worker._reqs_to_send
+    assert not worker._notif_tallies
+
+
+def test_pull_notifs_retire_readers_independently():
+    """Readers may declare different transfer counts, eg a split READ and a
+    full local cache hit that sends one zero-transfer ack."""
+    worker = _pull_notif_stub()
+
+    worker.nixl_wrapper.get_new_notifs = lambda: {
+        "d0": [b"req:2:2:0"],
+        "d1": [b"req:2:0:0"],
+    }
+    assert worker._get_new_notifs() == set()
+    assert "req" in worker._reqs_to_process
+
+    worker.nixl_wrapper.get_new_notifs = lambda: {"d0": [b"req:2:2:0"]}
+    assert worker._get_new_notifs() == {"req"}
+
+
+def test_pull_notifs_ignore_notifs_beyond_declared_count():
+    """Extra notifs from a reader must not stand in for another reader."""
+    worker = _pull_notif_stub()
+
+    worker.nixl_wrapper.get_new_notifs = lambda: {
+        "d0": [b"req:2:1:0", b"req:2:1:0", b"req:2:1:0"]
+    }
+    assert worker._get_new_notifs() == set()
+    assert "req" in worker._reqs_to_process
 
 
 def test_multi_kv_connector_stats_aggregation():
@@ -2521,7 +2576,6 @@ def recv_worker():
     worker._remote_registration_generations = {}
     worker._replicated_pcp_done_sending = set()
     worker._invalid_block_ids = queue.Queue()
-    worker._pending_recv_notifs = {}
     worker._reqs_to_send = {}
     worker._replicated_pcp_done_sending = set()
     worker._is_hma_required = False
@@ -2538,7 +2592,9 @@ def recv_worker():
     return worker
 
 
-def test_mixed_memory_read_notifies_after_both_transfers_finish(recv_worker):
+def test_mixed_memory_read_notifies_each_transfer(recv_worker):
+    """Both halves of a split READ carry a native notif declaring the split, so
+    D sends no notif of its own once they finish."""
     worker = recv_worker
     worker._desc_is_dram_by_block_size = {16: np.array([True, True, False, False])}
     worker._desc_pos_by_block_size = {16: np.array([0, 1, 0, 1])}
@@ -2555,7 +2611,8 @@ def test_mixed_memory_read_notifies_after_both_transfers_finish(recv_worker):
         local_block_descs_ids=np.array([0, 2]),
         remote_block_descs_ids=np.array([5, 7]),
         notif_agent="prefill",
-        notif_id=b"request:1",
+        remote_request_id="request",
+        expected_consumers=1,
     )
 
     dram_read, device_read = worker.nixl_wrapper.make_prepped_xfer.call_args_list
@@ -2567,24 +2624,22 @@ def test_mixed_memory_read_notifies_after_both_transfers_finish(recv_worker):
     assert device_read.args[3] == 30
     np.testing.assert_array_equal(device_read.args[2], [0])
     np.testing.assert_array_equal(device_read.args[4], [7])
-    worker.nixl_wrapper.send_notif.assert_not_called()
+    assert dram_read.kwargs["notif_msg"] == b"request:1:2:0"
+    assert device_read.kwargs["notif_msg"] == b"request:1:2:0"
 
     assert worker.get_finished() == (set(), {"request"})
-    worker.nixl_wrapper.send_notif.assert_called_once_with(
-        "prefill", notif_msg=b"request:1"
-    )
+    worker.nixl_wrapper.send_notif.assert_not_called()
 
 
 def test_mixed_memory_read_failure_does_not_notify_producer(recv_worker):
-    """A failed half of a split READ must suppress its success notification."""
+    """A failed half of a split READ must not notify the producer."""
     worker = recv_worker
     worker._recving_transfers = {"request": [101, 102]}
-    worker._pending_recv_notifs = {"request": [("prefill", b"request:1")]}
     worker.nixl_wrapper.check_xfer_state.side_effect = ["ERR", "DONE"]
 
     assert worker.get_finished() == (set(), {"request"})
 
-    assert "request" not in worker._pending_recv_notifs
+    assert worker.get_block_ids_with_load_errors() == {1, 2, 3}
     worker.nixl_wrapper.send_notif.assert_not_called()
 
 
@@ -2607,22 +2662,22 @@ def test_hisparse_dram_rank0_only_read_keeps_device_part(recv_worker):
         local_block_descs_ids=np.array([0, 2]),
         remote_block_descs_ids=np.array([5, 7]),
         notif_agent="prefill",
-        notif_id=b"request:1",
+        remote_request_id="request",
+        expected_consumers=1,
     )
 
     (device_read,) = worker.nixl_wrapper.make_prepped_xfer.call_args_list
     assert device_read.args[:2] == ("READ", 20)
     np.testing.assert_array_equal(device_read.args[2], [0])
     np.testing.assert_array_equal(device_read.args[4], [7])
+    assert device_read.kwargs["notif_msg"] == b"request:1:1:0"
 
     assert worker.get_finished() == (set(), {"request"})
-    worker.nixl_wrapper.send_notif.assert_called_once_with(
-        "prefill", notif_msg=b"request:1"
-    )
+    worker.nixl_wrapper.send_notif.assert_not_called()
 
 
 def test_hisparse_dram_rank0_only_dram_only_read_completes(recv_worker):
-    """With nothing left to read, the request still completes and notifies."""
+    """With nothing left to read, the request still completes and acks P."""
     worker = recv_worker
     worker.tp_rank = 1
     worker._skip_dram_xfer = True
@@ -2638,14 +2693,15 @@ def test_hisparse_dram_rank0_only_dram_only_read_completes(recv_worker):
         local_block_descs_ids=np.array([0, 1]),
         remote_block_descs_ids=np.array([5, 6]),
         notif_agent="prefill",
-        notif_id=b"request:1",
+        remote_request_id="request",
+        expected_consumers=1,
     )
 
     worker.nixl_wrapper.make_prepped_xfer.assert_not_called()
-    assert worker.get_finished() == (set(), {"request"})
     worker.nixl_wrapper.send_notif.assert_called_once_with(
-        "prefill", notif_msg=b"request:1"
+        "prefill", notif_msg=b"request:1:0:0"
     )
+    assert worker.get_finished() == (set(), {"request"})
 
 
 def element_byte_addrs(view: torch.Tensor) -> list[int]:
@@ -3504,7 +3560,7 @@ class TestPeerReplacement:
 
         self.worker.start_load_kv(NixlConnectorMetadata())
         self.transport.send_notif.assert_called_once_with(
-            "old", notif_msg=b"old-prefill:1"
+            "old", notif_msg=b"old-prefill:1:0:0"
         )
         result = self.worker.get_transfer_results()
         assert result.finished_recving == {"old-req"}
@@ -3999,7 +4055,6 @@ def test_handshake_failure_reports_only_awaited_recvs(
     )
     assert not worker._recving_metadata
     assert not worker._recv_failures
-    assert not worker._pending_recv_notifs
 
 
 @patch(
@@ -4505,7 +4560,6 @@ def test_recv_failure_waits_for_sibling_transfer(recv_worker, sibling_state):
     """Failure must not release blocks while a sibling can still write to them."""
     worker = recv_worker
     worker._recving_transfers["request"] = [101, 102]
-    worker._pending_recv_notifs = {"request": [("prefill", b"request:1")]}
     worker.nixl_wrapper.check_xfer_state.side_effect = ["ERR", "PROC", sibling_state]
 
     results = worker.get_transfer_results()
@@ -5068,11 +5122,11 @@ def test_handshake_decode_errors(default_vllm_config, dist_init, error_scenario)
         }
         assert {agent for agent, _ in send_notif_calls} == expected_recipients
 
-        # Every broadcast notif must be keyed by the prefill request id.
-        # Pre-fix this used the *decode* request id, which prefill ranks
-        # didn't recognize.
-        expected_notif = f"{prefill_req_id}:{decode_tp_size}".encode()
-        bad_notif = f"{decode_req_id}:{decode_tp_size}".encode()
+        # Every broadcast notif must be a zero-transfer ack keyed by the
+        # prefill request id. Pre-fix this used the *decode* request id,
+        # which prefill ranks didn't recognize.
+        expected_notif = f"{prefill_req_id}:{decode_tp_size}:0:0".encode()
+        bad_notif = f"{decode_req_id}:{decode_tp_size}:0:0".encode()
         for agent, notif in send_notif_calls:
             assert notif == expected_notif, (
                 f"Broadcast notif to {agent!r} must use prefill_req_id; "

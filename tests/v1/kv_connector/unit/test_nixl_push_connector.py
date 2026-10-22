@@ -362,7 +362,6 @@ class _StubWriterWorker(NixlPushConnectorWorker):
 
         # Base worker fields touched by start_load_kv / _get_new_notifs.
         w._recving_metadata = {}
-        w._pending_recv_notifs = {}
         w._failed_recv_reqs = queue.Queue()
         w._recv_failures = set()
         w._recving_transfers = defaultdict(list)
@@ -374,7 +373,7 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         w.draft_tp_mappings = {}
         w._head_sharded_draft_kv_heads = None
         w._head_sharded_draft_regions = set()
-        w.consumer_notification_counts_by_req = defaultdict(int)
+        w._notif_tallies = {}
         w.tp_rank = 0
         w.pcp_rank = 0
         w.pcp_dcp_sharded = False
@@ -928,9 +927,8 @@ class TestPushWriterNotifs:
         # for a request whose KV is being received.
         request_id = "req-recv-1"
         w._recving_metadata[request_id] = MagicMock(pp_size=1)
-        # Compose the standard completion notif: req_id:tp_size.
-        notif_msg = f"{request_id}:1".encode()
-        w._pending_completion_notifs.put(notif_msg)
+        notif_msg = f"{request_id}:1:1:0".encode()
+        w._pending_completion_notifs.put(("prefill-agent", notif_msg))
 
         w._get_new_notifs()
 
@@ -969,7 +967,6 @@ class TestPushWriterNotifs:
         w.xfer_stats = MagicMock()
         w._log_failure = MagicMock()  # type: ignore[method-assign]
         w._invalid_block_ids = queue.Queue()
-        w._pending_recv_notifs = {}
         w._replicated_pcp_done_sending = set()
         w.use_host_buffer = False
         return w
@@ -1043,7 +1040,6 @@ class TestPushWriterNotifs:
         assert request_id in w._reqs_to_send
         assert w._evict_finished_inbox.empty()
 
-        w.expected_consumer_notifications_by_req = {}
         w._reqs_to_send[request_id] = time.perf_counter() - 1
         assert w.get_transfer_results().finished_sending == {request_id}
         assert request_id not in w._send_failures
@@ -1057,6 +1053,7 @@ class TestPushWriterNotifs:
         w = self._pollable_worker()
         request_id = self._make_sending_req(w)
         w.transfer_topo.block_size_ratio.return_value = 1
+        w.transfer_topo.get_engine_info.return_value.remote_tp_size = 1
         w._apply_prefix_caching = MagicMock(return_value=([[1]], [[1]]))
         w._compute_desc_ids = MagicMock(return_value=[0])
         w.dst_num_blocks = {w.engine_id: 8}
@@ -1104,7 +1101,6 @@ class TestPushWriterNotifs:
         ]
         assert w.get_transfer_results().finished_sending == set()
 
-        w.expected_consumer_notifications_by_req = {}
         w._reqs_to_send[request_id] = time.perf_counter() - 1
         assert w.get_transfer_results().finished_sending == {request_id}
         assert w._evict_finished_inbox.get_nowait() == request_id
@@ -1350,7 +1346,7 @@ class TestPushWriterNegative:
         )
         w = _StubWriterWorker.fresh()
         # Forward a completion notif for an unknown request_id.
-        w._pending_completion_notifs.put(b"never-heard-of-you:1")
+        w._pending_completion_notifs.put(("prefill-agent", b"never-heard-of-you:1:1:0"))
 
         w._get_new_notifs()
         # Did not register anywhere.
@@ -1387,7 +1383,9 @@ class TestPushWriterNegative:
 
         # Forwarded heartbeat covers a tracked request, an unknown one,
         # and another tracked one.
-        w._pending_completion_notifs.put(b"HB:req-a,req-unknown,req-b")
+        w._pending_completion_notifs.put(
+            ("decode-agent", b"HB:req-a,req-unknown,req-b")
+        )
 
         w._get_new_notifs()
 
@@ -1416,19 +1414,35 @@ class TestPushPipelineParallel:
         w = _StubWriterWorker.fresh()
         request_id = "req-pp-2"
         w._recving_metadata[request_id] = MagicMock(pp_size=2)
-        notif = f"{request_id}:1".encode()
+        notif = f"{request_id}:2:1:0".encode()
 
         # First stage: counted, not yet done.
-        w._pending_completion_notifs.put(notif)
+        w._pending_completion_notifs.put(("p-stage-0", notif))
         w._get_new_notifs()
         assert request_id not in w._recving_transfers
-        assert w.consumer_notification_counts_by_req[request_id] == 1
 
         # Second (final) stage: now reported done.
-        w._pending_completion_notifs.put(notif)
+        w._pending_completion_notifs.put(("p-stage-1", notif))
         w._get_new_notifs()
         assert request_id in w._recving_transfers
-        assert request_id not in w.consumer_notification_counts_by_req
+        assert request_id not in w._notif_tallies
+
+    @pytest.mark.parametrize(
+        ("pp_size", "p_tp_size", "d_tp_size", "expected_senders"),
+        [(2, 1, 1, 2), (1, 4, 2, 2), (2, 4, 2, 4), (1, 2, 4, 1)],
+    )
+    def test_write_notif_declares_every_writer_of_a_decode_rank(
+        self, pp_size, p_tp_size, d_tp_size, expected_senders
+    ):
+        """P declares how many P ranks write to each D rank: every PP stage,
+        times the P ranks per D rank when P's TP is larger."""
+        w = _StubWriterWorker.fresh()
+        w.pp_size = pp_size
+        w.world_size = p_tp_size
+
+        assert w._write_notif("req", d_tp_size) == (
+            f"req:{expected_senders}:1:0".encode()
+        )
 
     def test_req_meta_reads_pp_size_from_kv_transfer_params(self):
         """D learns the producer's pp_size from kv_transfer_params (forwarded

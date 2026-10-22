@@ -31,8 +31,7 @@ def _worker_stub():
     w._reqs_to_send = {}
     w._lease_extension = 20
     w._reqs_to_process = set()
-    w.consumer_notification_counts_by_req = {}
-    w.expected_consumer_notifications_by_req = {}
+    w._notif_tallies = {}
     w.xfer_stats = MagicMock()
     return w
 

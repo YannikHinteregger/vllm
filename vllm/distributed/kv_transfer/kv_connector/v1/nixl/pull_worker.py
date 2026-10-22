@@ -14,6 +14,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlConnectorMetadata,
     ReqMeta,
+    TransferNotif,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
     ReadSpec,
@@ -379,24 +380,30 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             # have the blocks we need so they can update the request state.
             # Same thing for DCP (tp_size == dcp_size), so the raw tp_ratio already
             # reflects whether any remote replica is left unchosen.
-            notif_id = f"{meta.remote.request_id}:{plan.local_consumers}".encode()
+            ack = TransferNotif(
+                meta.remote.request_id, plan.local_consumers, num_transfers=0
+            )
             remote_agents = self._remote_agents[meta.remote.engine_id]
             for rank_to_notify, agent in remote_agents.items():
                 if rank_to_notify != (0, read_specs[0].remote_rank):
-                    try:
-                        self.nixl_wrapper.send_notif(agent, notif_msg=notif_id)
-                    except Exception as e:
-                        self._log_failure(
-                            failure_type="notification_failed",
-                            msg="Remote rank will not update request state. "
-                            "This may indicate network issues.",
-                            req_id=req_id,
-                            error=e,
-                            dst_engine_id=meta.remote.engine_id,
-                            remote_rank=rank_to_notify[1],
-                            remote_agent_name=agent,
-                        )
-                        self.xfer_stats.record_failed_notification()
+                    self._send_read_notif(req_id, agent, ack)
+
+    def _send_read_notif(
+        self, request_id: str, agent_name: str, notif: TransferNotif
+    ) -> None:
+        """Send a notif that no posted READ carries."""
+        try:
+            self.nixl_wrapper.send_notif(agent_name, notif_msg=notif.encode())
+        except Exception as e:
+            self._log_failure(
+                failure_type="notification_failed",
+                msg="P worker blocks will be freed after timeout. "
+                "This may indicate network issues.",
+                req_id=request_id,
+                error=e,
+                remote_agent_name=agent_name,
+            )
+            self.xfer_stats.record_failed_notification()
 
     def _read_blocks(
         self,
@@ -445,29 +452,15 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         # NOTE(rob): according to nvidia the staging blocks are used to
         # saturate IB with heterogeneous TP sizes.
 
-        # Number of local workers that will notify this producer worker.
-        # Propagate on notification so dst worker can wait before freeing.
-        notif_id = f"{remote_request_id}:{expected_consumers}".encode()
-
         # Full prefix cache hit: do not need to read remote blocks,
         # just notify P worker that we have the blocks we need.
         if not any(len(group) > 0 for group in local_block_ids):
             # A full prefix cache hit is indicated with an empty list.
-            agent_name = self._remote_agents[dst_engine_id][(0, remote_rank)]
-            try:
-                self.nixl_wrapper.send_notif(agent_name, notif_msg=notif_id)
-            except Exception as e:
-                self._log_failure(
-                    failure_type="notification_failed",
-                    msg="P worker blocks will be freed after timeout. "
-                    "This may indicate network issues.",
-                    req_id=request_id,
-                    error=e,
-                    dst_engine_id=dst_engine_id,
-                    remote_rank=remote_rank,
-                    remote_agent_name=agent_name,
-                )
-                self.xfer_stats.record_failed_notification()
+            self._send_read_notif(
+                request_id,
+                self._remote_agents[dst_engine_id][(0, remote_rank)],
+                TransferNotif(remote_request_id, expected_consumers, num_transfers=0),
+            )
             # Report even on notification failure: the KV is already local, and
             # an unreported parked request would hold its blocks forever.
             # Notify-only recvs must stay unreported (scheduler asserts).
@@ -548,7 +541,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     local_block_descs_ids=local_block_descs_ids,
                     remote_block_descs_ids=remote_block_descs_ids,
                     notif_agent=self._remote_agents[dst_engine_id][(0, remote_rank)],
-                    notif_id=notif_id,
+                    remote_request_id=remote_request_id,
+                    expected_consumers=expected_consumers,
                 )
                 return True
             handle = self.nixl_wrapper.make_prepped_xfer(
@@ -557,7 +551,9 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 local_block_descs_ids,
                 remote_xfer_side_handle,
                 remote_block_descs_ids,
-                notif_msg=notif_id,
+                notif_msg=TransferNotif(
+                    remote_request_id, expected_consumers, num_transfers=1
+                ).encode(),
             )
 
             # Begin async xfer.
@@ -592,7 +588,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         local_block_descs_ids: np.ndarray,
         remote_block_descs_ids: np.ndarray,
         notif_agent: str,
-        notif_id: bytes,
+        remote_request_id: str,
+        expected_consumers: int,
     ) -> None:
         """Split a READ across the local DRAM and device descriptor lists."""
         desc_is_dram = self._desc_is_dram_by_block_size[local_block_size_key]
@@ -604,39 +601,51 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         if self._skip_dram_xfer:
             # TP rank 0 reads the DRAM (shared host pool) part for every
             # local rank; keep only the device part. Register the request
-            # even if nothing is left, so it still completes and notifies.
+            # even if nothing is left, so it still completes.
             keep = ~is_dram
             local_ids = local_ids[keep]
             remote_ids = remote_ids[keep]
             is_dram = is_dram[keep]
             self._recving_transfers.setdefault(request_id, [])
         assert local_dram_handle is not None or not is_dram.any()
-        reads = (
-            (is_dram, local_dram_handle),
-            (~is_dram, local_device_handle),
-        )
+        reads = [
+            (mask, local_handle)
+            for mask, local_handle in (
+                (is_dram, local_dram_handle),
+                (~is_dram, local_device_handle),
+            )
+            if mask.any()
+        ]
+        if not reads:
+            self._send_read_notif(
+                request_id,
+                notif_agent,
+                TransferNotif(remote_request_id, expected_consumers, num_transfers=0),
+            )
+            return
+
+        notif_msg = TransferNotif(
+            remote_request_id, expected_consumers, num_transfers=len(reads)
+        ).encode()
         handles: list[int] = []
         try:
             for mask, local_handle in reads:
-                if mask.any():
-                    handles.append(
-                        self.nixl_wrapper.make_prepped_xfer(
-                            "READ",
-                            local_handle,
-                            desc_pos[local_ids[mask]],
-                            remote_xfer_side_handle,
-                            remote_ids[mask],
-                        )
+                handles.append(
+                    self.nixl_wrapper.make_prepped_xfer(
+                        "READ",
+                        local_handle,
+                        desc_pos[local_ids[mask]],
+                        remote_xfer_side_handle,
+                        remote_ids[mask],
+                        notif_msg=notif_msg,
                     )
+                )
         except Exception:
             for handle in handles:
                 if not self._try_release_xfer_handle(request_id, handle):
                     self._recving_transfers[request_id].append(handle)
             raise
 
-        self._pending_recv_notifs.setdefault(request_id, []).append(
-            (notif_agent, notif_id)
-        )
         for i, handle in enumerate(handles):
             try:
                 self.nixl_wrapper.transfer(handle)
@@ -650,14 +659,15 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
     def _get_new_notifs(self) -> set[str]:
         """Get req_ids which got a remote xfer message. When multiple consumers
         are reading from the same producer (heterogeneous TP or DCP
-        scenario), wait for all consumers to be done pulling.
+        scenario), wait for all consumers to be done pulling. A consumer is
+        done once the notifs of all of its READs have arrived.
 
         Also handles heartbeat notifications ("HB:req1,req2,...") by
         extending the lease on the referenced requests.
         """
         assert self.transfer_topo is not None
         notified_req_ids: set[str] = set()
-        for notifs in self.nixl_wrapper.get_new_notifs().values():
+        for agent_name, notifs in self.nixl_wrapper.get_new_notifs().items():
             for notif in notifs:
                 msg = notif.decode("utf-8")
 
@@ -666,7 +676,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     self._handle_heartbeat(msg[3:])
                     continue
 
-                req_id, expected_consumers = msg.rsplit(":", 1)
+                read_notif = TransferNotif.decode(msg)
+                req_id = read_notif.request_id
                 if (
                     req_id not in self._reqs_to_send
                     and req_id not in self._reqs_to_process
@@ -680,22 +691,10 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     )
                     continue
 
-                # Every reader of this req_id reports the same count (it's
-                # derived from aggregate topology, not the specific rank),
-                # so repeated notifications never disagree on it.
-                self.expected_consumer_notifications_by_req[req_id] = int(
-                    expected_consumers
-                )
-
-                self.consumer_notification_counts_by_req[req_id] += 1
                 # Wait all consumers (D) to be done reading before freeing.
-                if (
-                    self.consumer_notification_counts_by_req[req_id]
-                    == self.expected_consumer_notifications_by_req[req_id]
-                ):
-                    notified_req_ids.add(req_id)
-                    del self.consumer_notification_counts_by_req[req_id]
-                    del self.expected_consumer_notifications_by_req[req_id]
-                    self._reqs_to_process.remove(req_id)
-                    self._reqs_to_send.pop(req_id, None)
+                if self._count_transfer_notif(agent_name, read_notif) is None:
+                    continue
+                notified_req_ids.add(req_id)
+                self._reqs_to_process.remove(req_id)
+                self._reqs_to_send.pop(req_id, None)
         return notified_req_ids

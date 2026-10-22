@@ -99,6 +99,15 @@ The heartbeat is deferred to the next step once the handshake completes --- the 
 
 **On P (receiving):** In `_get_new_notifs()`, P's worker checks incoming NIXL notifications. Messages starting with `"HB:"` are routed to `_handle_heartbeat()`, which extends the lease expiry for each referenced request using `max(old_expiry, now + lease_extension)`. This ensures leases are never accidentally shortened.
 
+### Transfer completion notifications
+
+The side that waits for a transfer counts its notifications. P counts READ notifications from D in pull mode. D counts WRITE notifications from P in push mode. A notification reads `request_id:expected_senders:num_transfers:failed`:
+
+- `expected_senders`: how many peer workers the receiver waits for.
+- `num_transfers`: how many transfers this sender posts to the receiver for the request. Every notification from one sender declares the same number.
+
+Each posted transfer carries its notification as its NIXL completion notification. A split READ (a HiSparse read posts one READ per DRAM and device slice) thus yields one notification per READ. A sender with nothing to transfer (a full local cache hit, an empty DCP slice or an unused MLA replica) sends one notification with `num_transfers` set to 0. The receiver counts notifications per sending agent. The request is done once `expected_senders` senders have sent all of theirs.
+
 ## Bidirectional KV Transfer
 
 For multi-turn conversations, [bidirectional KV transfer](../features/disagg_prefill.md) allows D to cache KV blocks that P can pull from on subsequent turns. Since the timing of the next conversational turn is **client-dependent** (not controlled by the system), the heartbeat-based lease mechanism does not apply here. Instead, a separate `decoder_kv_blocks_ttl` (default 480s) provides a simple fixed timeout for blocks cached on D. If the client takes too long to continue the conversation, the blocks expire. D communicates back the expiry time so P can know when blocks are expired and recompute. Because the deadline is a `perf_counter` value produced on D and the two engines run in separate processes (with unrelated clocks), P estimates the clock offset to D from the handshake round-trip and applies it before comparing the deadline against its own `perf_counter`. Future work may extend a symmetric heartbeat mechanism to this case.

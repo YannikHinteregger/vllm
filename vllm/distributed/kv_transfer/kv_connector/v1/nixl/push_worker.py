@@ -55,6 +55,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     ReqId,
     ReqMeta,
     TransferHandle,
+    TransferNotif,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
     ReadSpec,
@@ -118,7 +119,8 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         # Cross-thread channels.
         self._reg_send_inbox: queue.Queue[tuple[str, dict[str, Any]]] = queue.Queue()
         self._finished_blocks_inbox: queue.Queue[tuple[str, BlockIds]] = queue.Queue()
-        self._pending_completion_notifs: queue.Queue[bytes] = queue.Queue()
+        # (sender agent, notif) pairs.
+        self._pending_completion_notifs: queue.Queue[tuple[str, bytes]] = queue.Queue()
         # Main thread → writer: req_ids whose lease has expired or whose
         # WRITE has completed. Writer drops them from
         # ``_push_finished_blocks`` so an unmatched entry doesn't keep the
@@ -296,12 +298,12 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                     self._pending_d_registrations.pop(rid, None)
 
                 # 4. NIXL notifs: route PUSH_REG; forward the rest.
-                for notifs in self.nixl_wrapper.get_new_notifs().values():
+                for agent_name, notifs in self.nixl_wrapper.get_new_notifs().items():
                     for notif in notifs:
                         if notif.startswith(PUSH_REG_NOTIF_PREFIX):
                             self._handle_push_reg_notif(notif)
                         else:
-                            self._pending_completion_notifs.put(notif)
+                            self._pending_completion_notifs.put((agent_name, notif))
             except Exception:
                 logger.exception("nixl-push-writer error; continuing")
 
@@ -678,8 +680,6 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 )
             )
 
-        notif_id = f"{remote_request_id}:{self.world_size}".encode()
-
         if len(local_block_ids) == 0:
             logger.warning("No blocks to push for request %s", request_id)
             return None
@@ -729,6 +729,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
 
         assert len(local_block_descs_ids) == len(remote_block_descs_ids)
 
+        notif_msg = self._write_notif(remote_request_id, remote_info.remote_tp_size)
         handle = None
         try:
             handle = self.nixl_wrapper.make_prepped_xfer(
@@ -737,7 +738,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 local_block_descs_ids,
                 remote_xfer_side_handle,
                 remote_block_descs_ids,
-                notif_msg=notif_id,
+                notif_msg=notif_msg,
             )
             self.nixl_wrapper.transfer(handle)
             # Caller tracks the handle (atomically with the request's other
@@ -762,6 +763,15 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 return handle
             return None
 
+    def _write_notif(self, remote_request_id: str, remote_tp_size: int) -> bytes:
+        """The notif D counts for this rank's WRITE of a request."""
+        # Each D rank hears from every PP stage, and from several P ranks
+        # when P's TP is larger.
+        expected_senders = self.pp_size * max(1, self.world_size // remote_tp_size)
+        return TransferNotif(
+            remote_request_id, expected_senders, num_transfers=1
+        ).encode()
+
     # --- Notification handling on engine main thread ------------------ #
 
     def _get_new_notifs(self) -> set[str]:
@@ -773,7 +783,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         """
         while True:
             try:
-                notif = self._pending_completion_notifs.get_nowait()
+                agent_name, notif = self._pending_completion_notifs.get_nowait()
             except queue.Empty:
                 break
 
@@ -782,24 +792,17 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 self._handle_heartbeat(msg[3:])
                 continue
 
-            req_id, tp_size = msg.rsplit(":", 1)
-
-            if (meta := self._recving_metadata.get(req_id)) is None:
+            write_notif = TransferNotif.decode(msg)
+            req_id = write_notif.request_id
+            if req_id not in self._recving_metadata:
                 # The lease may have expired before the notif arrived.
                 self.xfer_stats.record_notification_after_expiry()
                 logger.error(
                     "Unrecognized request %s notif (may have expired).", req_id
                 )
                 continue
-            # Consumer waits for one notif per producer rank writing
-            # here: pp_size stages * producers-per-consumer (>1 when
-            # producer TP > consumer TP; tp_size is the producer TP).
-            producers_per_consumer = max(1, int(tp_size) // self.world_size)
-            expected_notifs = meta.pp_size * producers_per_consumer
-            self.consumer_notification_counts_by_req[req_id] += 1
-            if self.consumer_notification_counts_by_req[req_id] < expected_notifs:
+            if self._count_transfer_notif(agent_name, write_notif) is None:
                 continue
-            del self.consumer_notification_counts_by_req[req_id]
             # P drove the transfer (we own no NIXL handle), so
             # materialise an empty ``_recving_transfers`` entry for
             # ``_pop_done_transfers`` to report done.
@@ -814,6 +817,10 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
 
         results = super().get_transfer_results()
         done_sending = results.finished_sending
+
+        # Independent receive failures can retire a request mid-count.
+        for req_id in results.finished_recving:
+            self._notif_tallies.pop(req_id, None)
 
         # ``_pop_done_transfers`` mutates ``_sending_transfers``; the
         # writer thread also appends to it, so guard the pop.
